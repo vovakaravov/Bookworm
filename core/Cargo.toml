@@ -1,0 +1,25 @@
+[package]
+name = "bookworm-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core EPUB parser/writer, library catalog, metadata lookup, Markdown export, and Syncthing conflict merger for Bookworm"
+license = "MIT"
+
+[features]
+default = []
+online-metadata = ["dep:ureq"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+percent-encoding = "2"
+roxmltree = "0.21.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "3", optional = true }
+walkdir = "2"
+zip = { version = "9.8.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
