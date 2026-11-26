@@ -929,6 +929,21 @@ pub fn paginate_chapter_blocks_for_view(
     paginate_measured_blocks(&measured, page_content_h, 0.0, 14.0)
 }
 
+pub const READER_BAR_HEIGHT: f32 = 48.0;
+
+/// Compute a Zen-invariant reader page viewport `(width, height)` from the full window size
+/// and safe-area insets by always reserving top bar + footer chrome height.
+pub fn zen_invariant_reader_viewport(
+    win_w: f32,
+    win_h: f32,
+    safe_top: f32,
+    safe_bottom: f32,
+) -> (f32, f32) {
+    let w = win_w.max(0.0);
+    let h = (win_h - safe_top - safe_bottom - READER_BAR_HEIGHT * 2.0).max(0.0);
+    (w, h)
+}
+
 pub fn reader_column_metrics(
     vp_w: f32,
     vp_h: f32,
@@ -985,8 +1000,13 @@ impl BookwormMobileApp {
 
         let mut subs = Vec::new();
         subs.push(
-            cx.subscribe_in(&library_search_input, window, |_, _, ev, window, cx| match ev {
-                InputEvent::Focus | InputEvent::Blur => {}
+            cx.subscribe_in(&library_search_input, window, |_, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Search, &b, &a, true);
+                }
+                InputEvent::Blur => {}
                 InputEvent::PressEnter { .. } => {
                     window.blur(cx);
                     gpui_mobile::hide_keyboard();
@@ -996,17 +1016,29 @@ impl BookwormMobileApp {
             }),
         );
         subs.push(
-            cx.subscribe_in(&highlight_note_input, window, |this, _, ev, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
+            cx.subscribe_in(&highlight_note_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Prose, &b, &a, true);
+                }
+                InputEvent::PressEnter { .. } => {
                     this.reader_save_highlight_draft(window, cx);
                 }
+                _ => {}
             }),
         );
         subs.push(
-            cx.subscribe_in(&folder_picker_input, window, |this, _, ev, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) {
+            cx.subscribe_in(&folder_picker_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Plain, &b, &a, true);
+                }
+                InputEvent::PressEnter { .. } => {
                     this.apply_folder_picker_input(window, cx);
                 }
+                _ => {}
             }),
         );
 
@@ -1663,7 +1695,6 @@ impl BookwormMobileApp {
                     }
                     if r.zen_mode {
                         r.zen_mode = false;
-                        r.needs_page_recompute = true;
                         cx.notify();
                         return;
                     }
@@ -2817,7 +2848,6 @@ impl BookwormMobileApp {
                 r.show_toc = false;
                 r.show_notes = false;
             }
-            r.needs_page_recompute = true;
             cx.notify();
         }
     }
@@ -3038,5 +3068,13 @@ mod tests {
             compute_handle_drag_update(SelectionHandleKind::End, s, e, pos(1, 4)),
             Some((pos(1, 4), s, SelectionHandleKind::Start))
         );
+    }
+
+    #[test]
+    fn zen_invariant_reader_viewport_reserves_bars_and_safe_areas() {
+        let (w, h) = super::zen_invariant_reader_viewport(412.0, 915.0, 32.0, 24.0);
+        assert_eq!(w, 412.0);
+        assert_eq!(h, 915.0 - 32.0 - 24.0 - super::READER_BAR_HEIGHT * 2.0);
+        assert_eq!(super::zen_invariant_reader_viewport(-10.0, 80.0, 50.0, 40.0), (0.0, 0.0));
     }
 }

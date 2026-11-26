@@ -633,6 +633,7 @@ fn render_page_spread_canvas(
     ch_blocks: &[EpubBlock],
     ch_idx: usize,
     use_two_col: bool,
+    zen_mode: bool,
     col_max_w: Option<f32>,
     max_img_h: f32,
     font_size: f32,
@@ -701,6 +702,7 @@ fn render_page_spread_canvas(
         .size_full()
         .flex()
         .justify_center()
+        .when(zen_mode, |d| d.py(px(super::READER_BAR_HEIGHT)))
         .child(
             div()
                 .w_full()
@@ -776,16 +778,16 @@ pub fn render_reader_view(
         .as_ref()
         .is_some_and(|r| !r.show_toc && !r.show_notes);
     if should_pag {
-        let vp_b = app
-            .reader
-            .as_ref()
-            .map(|r| r.viewport_bounds.get())
-            .unwrap_or_default();
-        let vp_w = f32::from(vp_b.size.width);
-        let vp_h = f32::from(vp_b.size.height);
-        if vp_w > 100.0 && vp_h > 100.0 {
-            app.ensure_reader_pages_and_sync(vp_w, vp_h, use_two_col, window);
-            app.maybe_schedule_adjacent_prepag(vp_w, vp_h, use_two_col, window, cx);
+        let win_sz = window.viewport_size();
+        let (pag_w, pag_h) = super::zen_invariant_reader_viewport(
+            f32::from(win_sz.width),
+            f32::from(win_sz.height),
+            app.safe_area.top,
+            app.safe_area.bottom,
+        );
+        if pag_w > 100.0 && pag_h > 100.0 {
+            app.ensure_reader_pages_and_sync(pag_w, pag_h, use_two_col, window);
+            app.maybe_schedule_adjacent_prepag(pag_w, pag_h, use_two_col, window, cx);
         } else {
             let entity = cx.entity().clone();
             window.on_next_frame(move |_, cx| {
@@ -913,8 +915,9 @@ pub fn render_reader_view(
 
     let top_bar = h_flex()
         .w_full()
+        .h(px(super::READER_BAR_HEIGHT))
+        .flex_shrink_0()
         .px_3()
-        .py_2()
         .bg(hex_color(pal.surface))
         .border_b_1()
         .border_color(hex_color(pal.border))
@@ -1536,8 +1539,14 @@ pub fn render_reader_view(
             rendered_layouts.borrow_mut().clear();
         }
         let vp_w_cur = f32::from(vp_bounds.size.width).max(300.0);
-        let vp_h_cur = f32::from(vp_bounds.size.height).max(200.0);
-        let max_img_h = (vp_h_cur - 32.0) * 0.68;
+        let win_sz = window.viewport_size();
+        let (_, pag_h_cur) = super::zen_invariant_reader_viewport(
+            f32::from(win_sz.width),
+            f32::from(win_sz.height),
+            app.safe_area.top,
+            app.safe_area.bottom,
+        );
+        let max_img_h = (pag_h_cur.max(200.0) - 32.0) * 0.68;
 
         {
             let step = if use_two_col { 2usize } else { 1usize };
@@ -1553,6 +1562,7 @@ pub fn render_reader_view(
                 cur_blocks,
                 ch_idx,
                 use_two_col,
+                zen_mode,
                 col_max_w,
                 max_img_h,
                 app.reader_font_size,
@@ -1577,6 +1587,7 @@ pub fn render_reader_view(
                         cur_blocks,
                         ch_idx,
                         use_two_col,
+                        zen_mode,
                         col_max_w,
                         max_img_h,
                         app.reader_font_size,
@@ -1605,6 +1616,7 @@ pub fn render_reader_view(
                         nblocks,
                         nch,
                         use_two_col,
+                        zen_mode,
                         col_max_w,
                         max_img_h,
                         app.reader_font_size,
@@ -1630,6 +1642,7 @@ pub fn render_reader_view(
                         cur_blocks,
                         ch_idx,
                         use_two_col,
+                        zen_mode,
                         col_max_w,
                         max_img_h,
                         app.reader_font_size,
@@ -1662,6 +1675,7 @@ pub fn render_reader_view(
                         pblocks,
                         pch,
                         use_two_col,
+                        zen_mode,
                         col_max_w,
                         max_img_h,
                         app.reader_font_size,
@@ -2677,12 +2691,12 @@ pub fn render_reader_view(
         .w_full()
         .flex_shrink_0()
         .bg(hex_color(pal.surface))
-        .border_t_1()
-        .border_color(hex_color(pal.border))
         .child(
             h_flex()
                 .w_full()
-                .h(px(48.))
+                .h(px(super::READER_BAR_HEIGHT))
+                .border_t_1()
+                .border_color(hex_color(pal.border))
                 .px_3()
                 .justify_between()
                 .items_center()
