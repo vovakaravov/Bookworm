@@ -839,11 +839,37 @@ pub fn render_reader_view(
         *draft_sheet_bounds_ref.borrow_mut() = None;
     }
     let rendered_layouts = &r.rendered_layouts;
+    let layouts_measured_slot = r.layouts_measured.clone();
     let slice_cache = &r.slice_render_cache;
     let highlights_epoch = r.highlights_epoch;
     let decoded_images = &r.decoded_images;
     let vp_slot = r.viewport_bounds.clone();
     let vp_bounds = r.viewport_bounds.get();
+    // Must compute dock_top BEFORE rendered_layouts is cleared and refilled with unmeasured TextLayouts.
+    let dock_top = if draft.is_some() {
+        let (sg, eg) = r.selection_handle_geometries(vp_bounds);
+        let sel_mid_y = match (sg, eg) {
+            (Some((sp, _)), Some((ep, elh))) => {
+                Some((f32::from(sp.y) + f32::from(ep.y) + elh) * 0.5)
+            }
+            (Some((p, lh)), None) | (None, Some((p, lh))) => Some(f32::from(p.y) + lh * 0.5),
+            (None, None) => None,
+        };
+        let dock = resolve_draft_dock_top(
+            sel_mid_y,
+            f32::from(vp_bounds.origin.y),
+            f32::from(vp_bounds.size.height),
+            r.draft_dock_top.get(),
+            r.draft_dock_initialized.get(),
+        );
+        if sel_mid_y.is_some() {
+            r.draft_dock_top.set(dock);
+            r.draft_dock_initialized.set(true);
+        }
+        dock
+    } else {
+        false
+    };
     let visual_swipe_x = r.visual_swipe_offset_x();
     let is_anim_or_swipe = r.flip_anim.is_some() || r.swipe_active;
     let (page_idx, total_pages) = {
@@ -1506,6 +1532,7 @@ pub fn render_reader_view(
     } else {
         let active_layouts = (!is_anim_or_swipe).then_some(rendered_layouts);
         if !is_anim_or_swipe {
+            layouts_measured_slot.set(false);
             rendered_layouts.borrow_mut().clear();
         }
         let vp_w_cur = f32::from(vp_bounds.size.width).max(300.0);
@@ -1657,10 +1684,14 @@ pub fn render_reader_view(
 
             let app_weak_page = cx.entity().downgrade();
             let vp_measure = vp_slot.clone();
+            let layouts_measured_ready = layouts_measured_slot.clone();
             let paint_accent = hex_color(pal.accent);
             let paint_border = hex_color(pal.fg);
             let page_touch_canvas = canvas(
-                move |bounds, _, _| vp_measure.set(bounds),
+                move |bounds, _, _| {
+                    vp_measure.set(bounds);
+                    layouts_measured_ready.set(true);
+                },
                 move |bounds, _, window, cx| {
                     if let Some(app_ent) = app_weak_page.upgrade() {
                         let app = app_ent.read(cx);
@@ -2318,28 +2349,6 @@ pub fn render_reader_view(
         (48.0 + app.safe_area.bottom).max(kb_height)
     };
     let draft_sheet_top = if zen_mode { 8.0 } else { 52.0 };
-    let dock_top = if draft.is_some() {
-        let (sg, eg) = r.selection_handle_geometries(vp_bounds);
-        let sel_mid_y = match (sg, eg) {
-            (Some((sp, _)), Some((ep, elh))) => Some((f32::from(sp.y) + f32::from(ep.y) + elh) * 0.5),
-            (Some((p, lh)), None) | (None, Some((p, lh))) => Some(f32::from(p.y) + lh * 0.5),
-            (None, None) => None,
-        };
-        let dock = resolve_draft_dock_top(
-            sel_mid_y,
-            f32::from(vp_bounds.origin.y),
-            f32::from(vp_bounds.size.height),
-            r.draft_dock_top.get(),
-            r.draft_dock_initialized.get(),
-        );
-        if sel_mid_y.is_some() {
-            r.draft_dock_top.set(dock);
-            r.draft_dock_initialized.set(true);
-        }
-        dock
-    } else {
-        false
-    };
     let dict_lookup_state = r.dict_lookup.clone();
     let draft_bounds_tracker = draft_sheet_bounds_ref.clone();
     let floating_draft_sheet = draft.clone().map(|d| {

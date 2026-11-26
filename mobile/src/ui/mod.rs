@@ -274,6 +274,7 @@ pub struct ReaderState {
     pub flip_anim_gen: u64,
     /// `(block_idx, byte_base, slice_len, TextLayout)` for currently interactive page/viewport.
     pub rendered_layouts: Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>,
+    pub layouts_measured: Rc<Cell<bool>>,
     pub highlights_epoch: u64,
     pub slice_render_cache: RefCell<HashMap<SliceRenderKey, SliceRenderValue>>,
     pub decoded_images: RefCell<HashMap<(usize, usize), Arc<Image>>>,
@@ -378,6 +379,9 @@ impl ReaderState {
         pos: Point<Pixels>,
         clip_bounds: Option<Bounds<Pixels>>,
     ) -> Option<TextPos> {
+        if !self.layouts_measured.get() {
+            return None;
+        }
         let layouts = self.rendered_layouts.borrow();
         if layouts.is_empty() {
             return None;
@@ -454,6 +458,9 @@ impl ReaderState {
         pos: Point<Pixels>,
         clip_bounds: Option<Bounds<Pixels>>,
     ) -> Option<TextPos> {
+        if !self.layouts_measured.get() {
+            return None;
+        }
         let layouts = self.rendered_layouts.borrow();
         if layouts.is_empty() {
             return None;
@@ -515,6 +522,9 @@ impl ReaderState {
         &self,
         clip_bounds: Bounds<Pixels>,
     ) -> (Option<(Point<Pixels>, f32)>, Option<(Point<Pixels>, f32)>) {
+        if !self.layouts_measured.get() {
+            return (None, None);
+        }
         let Some((start, end)) = self.normalized_selection() else {
             return (None, None);
         };
@@ -2362,6 +2372,7 @@ impl BookwormMobileApp {
                     flip_anim: None,
                     flip_anim_gen: 0,
                     rendered_layouts: Rc::new(RefCell::new(Vec::new())),
+                    layouts_measured: Rc::new(Cell::new(false)),
                     highlights_epoch: 0,
                     slice_render_cache: RefCell::new(HashMap::new()),
                     decoded_images: RefCell::new(HashMap::new()),
@@ -2390,6 +2401,7 @@ impl BookwormMobileApp {
             r.pending_last_page = false;
             r.needs_page_recompute = true;
             r.prepag_scheduled = false;
+            r.layouts_measured.set(false);
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = None;
@@ -2425,6 +2437,7 @@ impl BookwormMobileApp {
             r.show_notes = false;
             r.draft = None;
             r.prepag_scheduled = false;
+            r.layouts_measured.set(false);
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = Some((hl.start_block, hl.start_offset));
             r.pending_scroll_fraction = Some(frac);
@@ -2455,6 +2468,7 @@ impl BookwormMobileApp {
             r.show_notes = false;
             r.draft = None;
             r.prepag_scheduled = false;
+            r.layouts_measured.set(false);
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = Some(frac);
@@ -2785,6 +2799,7 @@ impl BookwormMobileApp {
         self.reader_width = width;
         self.library_store.reader_prefs.width = width;
         if let Some(r) = &mut self.reader {
+            r.layouts_measured.set(false);
             r.rendered_layouts.borrow_mut().clear();
             r.needs_page_recompute = true;
         }
@@ -2810,6 +2825,7 @@ impl BookwormMobileApp {
     pub fn toggle_two_column_spread(&mut self, cx: &mut Context<Self>) {
         self.two_column_spread = !self.two_column_spread;
         if let Some(r) = &mut self.reader {
+            r.layouts_measured.set(false);
             r.rendered_layouts.borrow_mut().clear();
             r.needs_page_recompute = true;
         }
