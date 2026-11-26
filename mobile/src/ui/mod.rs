@@ -116,6 +116,48 @@ pub enum PageTouchMode {
     HandleDrag(SelectionHandleKind),
 }
 
+pub fn extend_long_press_selection(
+    anchor_word: (TextPos, TextPos),
+    hit: TextPos,
+) -> (TextPos, TextPos) {
+    let (w_start, w_end) = anchor_word;
+    if hit < w_start {
+        (w_end, hit)
+    } else if hit > w_end {
+        (w_start, hit)
+    } else {
+        (w_start, w_end)
+    }
+}
+
+pub fn compute_handle_drag_update(
+    handle: SelectionHandleKind,
+    cur_start: TextPos,
+    cur_end: TextPos,
+    hit: TextPos,
+) -> Option<(TextPos, TextPos, SelectionHandleKind)> {
+    match handle {
+        SelectionHandleKind::Start => {
+            if hit < cur_end {
+                Some((hit, cur_end, SelectionHandleKind::Start))
+            } else if hit > cur_end {
+                Some((cur_end, hit, SelectionHandleKind::End))
+            } else {
+                None
+            }
+        }
+        SelectionHandleKind::End => {
+            if hit > cur_start {
+                Some((cur_start, hit, SelectionHandleKind::End))
+            } else if hit < cur_start {
+                Some((hit, cur_start, SelectionHandleKind::Start))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PageFlipAnimation {
     pub dir: i8,
@@ -188,6 +230,8 @@ pub struct ReaderState {
     pub notes_color_filter: Option<HighlightColor>,
     pub notes_only_filter: bool,
     pub draft: Option<HighlightEditorDraft>,
+    pub draft_dock_top: Cell<bool>,
+    pub draft_dock_initialized: Cell<bool>,
     pub dict_lookup: Option<DictLookupState>,
     pub dict_lookup_gen: u64,
     pub draft_sheet_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -205,7 +249,14 @@ pub struct ReaderState {
     pub selection_anchor: Option<TextPos>,
     pub selection_head: Option<TextPos>,
     pub is_long_press_selecting: bool,
+    pub long_press_anchor_word: Option<(TextPos, TextPos)>,
+    pub long_press_origin_pos: Option<Point<Pixels>>,
+    pub long_press_dragged: bool,
     pub dragging_handle: Option<SelectionHandleKind>,
+    pub handle_drag_offset_y: f32,
+    #[allow(clippy::type_complexity)]
+    pub sel_handle_positions:
+        Rc<RefCell<Option<(Option<(Point<Pixels>, f32)>, Option<(Point<Pixels>, f32)>)>>>,
     pub mouse_down_pos: Option<Point<Pixels>>,
     pub is_mouse_selecting: bool,
     pub page_touch_mode: Option<PageTouchMode>,
@@ -271,7 +322,12 @@ impl ReaderState {
         self.selection_anchor = None;
         self.selection_head = None;
         self.is_long_press_selecting = false;
+        self.long_press_anchor_word = None;
+        self.long_press_origin_pos = None;
+        self.long_press_dragged = false;
         self.dragging_handle = None;
+        self.draft_dock_initialized.set(false);
+        *self.sel_handle_positions.borrow_mut() = None;
         self.mouse_down_pos = None;
         self.is_mouse_selecting = false;
         self.draft = None;
@@ -338,8 +394,8 @@ impl ReaderState {
             if !in_clip(b) {
                 continue;
             }
-            if b.top() - px(8.) <= pos.y
-                && pos.y <= b.bottom() + px(8.)
+            if b.top() <= pos.y
+                && pos.y <= b.bottom()
                 && b.left() - px(18.) <= pos.x
                 && pos.x <= b.right() + px(18.)
             {
@@ -455,15 +511,15 @@ impl ReaderState {
         })
     }
 
-    pub fn selection_handle_points(
+    pub fn selection_handle_geometries(
         &self,
         clip_bounds: Bounds<Pixels>,
-    ) -> (Option<Point<Pixels>>, Option<Point<Pixels>>) {
+    ) -> (Option<(Point<Pixels>, f32)>, Option<(Point<Pixels>, f32)>) {
         let Some((start, end)) = self.normalized_selection() else {
             return (None, None);
         };
         let layouts = self.rendered_layouts.borrow();
-        let find_pt = |tp: TextPos, bottom: bool| -> Option<Point<Pixels>> {
+        let find_pt = |tp: TextPos| -> Option<(Point<Pixels>, f32)> {
             let entry = layouts
                 .iter()
                 .find(|(b, base, slen, _)| {
@@ -474,16 +530,14 @@ impl ReaderState {
                 .or_else(|| layouts.iter().find(|(b, _, _, _)| *b == tp.block_idx))?;
             let (_, base, slen, layout) = entry;
             let rel_off = tp.byte_offset.saturating_sub(*base).min(*slen);
-            let mut pt = layout.position_for_index(rel_off)?;
-            if bottom {
-                pt.y += layout.line_height();
-            }
-            if pt.y < clip_bounds.top() - px(16.) || pt.y > clip_bounds.bottom() + px(16.) {
+            let pt = layout.position_for_index(rel_off)?;
+            let lh = f32::from(layout.line_height()).max(14.0);
+            if pt.y + px(lh) < clip_bounds.top() - px(16.) || pt.y > clip_bounds.bottom() + px(16.) {
                 return None;
             }
-            Some(pt)
+            Some((pt, lh))
         };
-        (find_pt(start, true), find_pt(end, true))
+        (find_pt(start), find_pt(end))
     }
 
     pub fn select_word_at_point(
@@ -517,6 +571,7 @@ impl ReaderState {
             block_idx: hit.block_idx,
             byte_offset: b,
         });
+        self.draft_dock_initialized.set(false);
         self.draft = None;
         true
     }
@@ -535,26 +590,18 @@ impl ReaderState {
         let Some((cur_start, cur_end)) = self.normalized_selection() else {
             return false;
         };
-        match handle {
-            SelectionHandleKind::Start => {
-                if hit < cur_end {
-                    self.selection_anchor = Some(hit);
-                    self.selection_head = Some(cur_end);
-                } else {
-                    self.selection_anchor = Some(cur_end);
-                    self.selection_head = Some(hit);
-                }
-            }
-            SelectionHandleKind::End => {
-                if hit > cur_start {
-                    self.selection_anchor = Some(cur_start);
-                    self.selection_head = Some(hit);
-                } else {
-                    self.selection_anchor = Some(hit);
-                    self.selection_head = Some(cur_start);
-                }
-            }
+        let Some((new_anchor, new_head, new_handle)) =
+            compute_handle_drag_update(handle, cur_start, cur_end, hit)
+        else {
+            return false;
+        };
+        self.dragging_handle = Some(new_handle);
+        self.page_touch_mode = Some(PageTouchMode::HandleDrag(new_handle));
+        if self.selection_anchor == Some(new_anchor) && self.selection_head == Some(new_head) {
+            return false;
         }
+        self.selection_anchor = Some(new_anchor);
+        self.selection_head = Some(new_head);
         self.sync_draft_from_selection(last_color, last_style);
         true
     }
@@ -2271,6 +2318,8 @@ impl BookwormMobileApp {
                     notes_color_filter: None,
                     notes_only_filter: false,
                     draft: None,
+                    draft_dock_top: Cell::new(false),
+                    draft_dock_initialized: Cell::new(false),
                     dict_lookup: None,
                     dict_lookup_gen: 0,
                     draft_sheet_bounds: Rc::new(RefCell::new(None)),
@@ -2291,7 +2340,12 @@ impl BookwormMobileApp {
                     selection_anchor: None,
                     selection_head: None,
                     is_long_press_selecting: false,
+                    long_press_anchor_word: None,
+                    long_press_origin_pos: None,
+                    long_press_dragged: false,
                     dragging_handle: None,
+                    handle_drag_offset_y: 16.0,
+                    sel_handle_positions: Rc::new(RefCell::new(None)),
                     mouse_down_pos: None,
                     is_mouse_selecting: false,
                     page_touch_mode: None,
@@ -2423,6 +2477,7 @@ impl BookwormMobileApp {
         self.highlight_note_input
             .update(cx, |inp, cx| inp.set_value(hl.note.clone(), window, cx));
         if let Some(r) = &mut self.reader {
+            r.draft_dock_initialized.set(false);
             r.selection_anchor = Some(TextPos {
                 block_idx: hl.start_block,
                 byte_offset: hl.start_offset,
@@ -2610,7 +2665,12 @@ impl BookwormMobileApp {
             r.selection_anchor = None;
             r.selection_head = None;
             r.is_long_press_selecting = false;
+            r.long_press_anchor_word = None;
+            r.long_press_origin_pos = None;
+            r.long_press_dragged = false;
             r.dragging_handle = None;
+            r.draft_dock_initialized.set(false);
+            *r.sel_handle_positions.borrow_mut() = None;
             let ch_title = r
                 .book
                 .chapters
@@ -2659,6 +2719,13 @@ impl BookwormMobileApp {
         if let Some(r) = &mut self.reader {
             r.selection_anchor = None;
             r.selection_head = None;
+            r.is_long_press_selecting = false;
+            r.long_press_anchor_word = None;
+            r.long_press_origin_pos = None;
+            r.long_press_dragged = false;
+            r.dragging_handle = None;
+            r.draft_dock_initialized.set(false);
+            *r.sel_handle_positions.borrow_mut() = None;
             if let Some(d) = r.draft.take()
                 && let Some(id) = d.existing_id
             {
@@ -2889,5 +2956,71 @@ impl Render for BookwormMobileApp {
                         ))
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SelectionHandleKind, TextPos, compute_handle_drag_update, extend_long_press_selection,
+    };
+
+    fn pos(block_idx: usize, byte_offset: usize) -> TextPos {
+        TextPos {
+            block_idx,
+            byte_offset,
+        }
+    }
+
+    #[test]
+    fn extend_long_press_selection_preserves_whole_word_and_extends_both_ways() {
+        let word = (pos(2, 10), pos(2, 20));
+        // Inside-word jitter keeps entire word selected
+        assert_eq!(extend_long_press_selection(word, pos(2, 14)), word);
+        assert_eq!(extend_long_press_selection(word, pos(2, 10)), word);
+        assert_eq!(extend_long_press_selection(word, pos(2, 20)), word);
+        // Extending forward anchors at word start
+        assert_eq!(
+            extend_long_press_selection(word, pos(2, 28)),
+            (pos(2, 10), pos(2, 28))
+        );
+        // Extending backward anchors at word end
+        assert_eq!(
+            extend_long_press_selection(word, pos(2, 3)),
+            (pos(2, 20), pos(2, 3))
+        );
+    }
+
+    #[test]
+    fn compute_handle_drag_update_flips_on_crossover_and_never_collapses() {
+        let s = pos(1, 10);
+        let e = pos(1, 20);
+        // Normal Start/End drags
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::Start, s, e, pos(1, 5)),
+            Some((pos(1, 5), e, SelectionHandleKind::Start))
+        );
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::End, s, e, pos(1, 30)),
+            Some((s, pos(1, 30), SelectionHandleKind::End))
+        );
+        // Collapsing to empty is rejected
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::Start, s, e, e),
+            None
+        );
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::End, s, e, s),
+            None
+        );
+        // Crossing over flips the active handle
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::Start, s, e, pos(1, 25)),
+            Some((e, pos(1, 25), SelectionHandleKind::End))
+        );
+        assert_eq!(
+            compute_handle_drag_update(SelectionHandleKind::End, s, e, pos(1, 4)),
+            Some((pos(1, 4), s, SelectionHandleKind::Start))
+        );
     }
 }

@@ -727,6 +727,29 @@ pub fn edge_tap_direction(rel_x: f32, viewport_w: f32) -> i8 {
     }
 }
 
+pub(crate) fn resolve_draft_dock_top(
+    sel_mid_y: Option<f32>,
+    vp_top: f32,
+    vp_height: f32,
+    prev_dock_top: bool,
+    initialized: bool,
+) -> bool {
+    let Some(mid_y) = sel_mid_y else {
+        return prev_dock_top && initialized;
+    };
+    if vp_height <= 1.0 {
+        return false;
+    }
+    let center_y = vp_top + vp_height * 0.5;
+    if !initialized {
+        mid_y >= center_y
+    } else if prev_dock_top {
+        mid_y >= center_y - 20.0
+    } else {
+        mid_y > center_y + 20.0
+    }
+}
+
 pub fn render_reader_view(
     app: &mut BookwormMobileApp,
     window: &mut Window,
@@ -823,12 +846,6 @@ pub fn render_reader_view(
     let vp_bounds = r.viewport_bounds.get();
     let visual_swipe_x = r.visual_swipe_offset_x();
     let is_anim_or_swipe = r.flip_anim.is_some() || r.swipe_active;
-    let is_long_pressing = r.is_long_press_selecting;
-    let handle_points = if !*show_toc && !*show_notes && !is_long_pressing {
-        r.selection_handle_points(vp_bounds)
-    } else {
-        (None, None)
-    };
     let (page_idx, total_pages) = {
         let tp = r.chapter_pages.len().max(1);
         let cp = r.current_page.min(tp - 1);
@@ -1640,9 +1657,61 @@ pub fn render_reader_view(
 
             let app_weak_page = cx.entity().downgrade();
             let vp_measure = vp_slot.clone();
+            let paint_accent = hex_color(pal.accent);
+            let paint_border = hex_color(pal.fg);
             let page_touch_canvas = canvas(
                 move |bounds, _, _| vp_measure.set(bounds),
-                move |bounds, _, window, _cx| {
+                move |bounds, _, window, cx| {
+                    if let Some(app_ent) = app_weak_page.upgrade() {
+                        let app = app_ent.read(cx);
+                        if let Some(r) = &app.reader {
+                            if !r.show_toc
+                                && !r.show_notes
+                                && !r.swipe_active
+                                && r.flip_anim.is_none()
+                                && r.normalized_selection().is_some()
+                            {
+                                let (sh, eh) = r.selection_handle_geometries(bounds);
+                                let sk = sh.map(|(p, lh)| (point(p.x, p.y + px(lh) + px(8.0)), lh));
+                                let ek = eh.map(|(p, lh)| (point(p.x, p.y + px(lh) + px(8.0)), lh));
+                                *r.sel_handle_positions.borrow_mut() =
+                                    if sk.is_some() || ek.is_some() {
+                                        Some((sk, ek))
+                                    } else {
+                                        None
+                                    };
+                                let paint_handle =
+                                    |win: &mut Window, pt: Point<Pixels>, lh: f32| {
+                                        win.paint_quad(fill(
+                                            Bounds {
+                                                origin: pt,
+                                                size: size(px(2.), px(lh)),
+                                            },
+                                            paint_accent,
+                                        ));
+                                        win.paint_quad(quad(
+                                            Bounds {
+                                                origin: point(pt.x - px(8.), pt.y + px(lh)),
+                                                size: size(px(16.), px(16.)),
+                                            },
+                                            px(8.),
+                                            paint_accent,
+                                            gpui::Edges::all(px(1.5)),
+                                            paint_border,
+                                            BorderStyle::Solid,
+                                        ));
+                                    };
+                                if let Some((sp, slh)) = sh {
+                                    paint_handle(window, sp, slh);
+                                }
+                                if let Some((ep, elh)) = eh {
+                                    paint_handle(window, ep, elh);
+                                }
+                            } else {
+                                *r.sel_handle_positions.borrow_mut() = None;
+                            }
+                        }
+                    }
                     let weak_td = app_weak_page.clone();
                     window.on_mouse_event(move |ev: &TouchDragEvent, phase, window, cx| {
                         if phase != DispatchPhase::Bubble {
@@ -1652,15 +1721,30 @@ pub fn render_reader_view(
                             return;
                         }
                         let _ = weak_td.update(cx, |app, cx| {
+                            let in_active_drag = app.reader.as_ref().is_some_and(|r| {
+                                matches!(
+                                    r.page_touch_mode,
+                                    Some(
+                                        PageTouchMode::HandleDrag(_)
+                                            | PageTouchMode::LongPressSelecting
+                                            | PageTouchMode::HorizontalSwipe
+                                    )
+                                )
+                            });
+                            let check_pos = if ev.phase == TouchPhase::Started {
+                                ev.start_position
+                            } else {
+                                ev.position
+                            };
                             let in_overlay = app.reader.as_ref().is_some_and(|r| {
                                 r.draft_sheet_bounds
                                     .borrow()
-                                    .is_some_and(|b| b.contains(&ev.position))
+                                    .is_some_and(|b| b.contains(&check_pos))
                                     || r.settings_strip_bounds
                                         .borrow()
-                                        .is_some_and(|b| b.contains(&ev.position))
+                                        .is_some_and(|b| b.contains(&check_pos))
                             });
-                            if in_overlay {
+                            if !in_active_drag && in_overlay {
                                 return;
                             }
                             let is_reading = app
@@ -1686,26 +1770,47 @@ pub fn render_reader_view(
                                     let Some(r) = &mut app.reader else {
                                         return;
                                     };
-                                    let (s_pt, e_pt) = r.selection_handle_points(bounds);
-                                    let hit_radius_sq = 36.0_f32 * 36.0;
-                                    let near = |pt_opt: Option<Point<Pixels>>| -> Option<f32> {
-                                        let p = pt_opt?;
+                                    let cached_knobs = *r.sel_handle_positions.borrow();
+                                    let (s_knob, e_knob) = cached_knobs.unwrap_or_else(|| {
+                                        let (sh, eh) = r.selection_handle_geometries(bounds);
+                                        let sk = sh.map(|(p, lh)| {
+                                            (point(p.x, p.y + px(lh) + px(8.0)), lh)
+                                        });
+                                        let ek = eh.map(|(p, lh)| {
+                                            (point(p.x, p.y + px(lh) + px(8.0)), lh)
+                                        });
+                                        (sk, ek)
+                                    });
+                                    let hit_radius_sq = 32.0_f32 * 32.0;
+                                    let near = |pt_opt: Option<(Point<Pixels>, f32)>| -> Option<(f32, Point<Pixels>, f32)> {
+                                        let (p, lh) = pt_opt?;
                                         let dx = f32::from(ev.start_position.x - p.x);
                                         let dy = f32::from(ev.start_position.y - p.y);
                                         let d2 = dx * dx + dy * dy;
-                                        (d2 <= hit_radius_sq).then_some(d2)
+                                        (d2 <= hit_radius_sq).then_some((d2, p, lh))
                                     };
-                                    let chosen_handle = match (near(s_pt), near(e_pt)) {
-                                        (Some(a), Some(b)) => Some(if a <= b {
-                                            SelectionHandleKind::Start
-                                        } else {
-                                            SelectionHandleKind::End
-                                        }),
-                                        (Some(_), None) => Some(SelectionHandleKind::Start),
-                                        (None, Some(_)) => Some(SelectionHandleKind::End),
+                                    let chosen_handle = match (near(s_knob), near(e_knob)) {
+                                        (Some((da, pa, lha)), Some((db, pb, lhb))) => Some(
+                                            if da <= db {
+                                                (SelectionHandleKind::Start, pa, lha)
+                                            } else {
+                                                (SelectionHandleKind::End, pb, lhb)
+                                            },
+                                        ),
+                                        (Some((_, p, lh)), None) => {
+                                            Some((SelectionHandleKind::Start, p, lh))
+                                        }
+                                        (None, Some((_, p, lh))) => {
+                                            Some((SelectionHandleKind::End, p, lh))
+                                        }
                                         (None, None) => None,
                                     };
-                                    if let Some(kind) = chosen_handle {
+                                    if let Some((kind, knob_pt, lh)) = chosen_handle {
+                                        let line_center_y =
+                                            f32::from(knob_pt.y) - 8.0 - lh * 0.5;
+                                        r.handle_drag_offset_y =
+                                            (f32::from(ev.start_position.y) - line_center_y)
+                                                .clamp(10.0, 36.0);
                                         r.dragging_handle = Some(kind);
                                         r.page_touch_mode = Some(PageTouchMode::HandleDrag(kind));
                                         r.page_touch_gen = r.page_touch_gen.wrapping_add(1);
@@ -1746,6 +1851,10 @@ pub fn render_reader_view(
                                             }
                                             let lp_pos = r.page_touch_cur_pos;
                                             if r.select_word_at_point(lp_pos, Some(lp_bounds)) {
+                                                r.long_press_anchor_word =
+                                                    r.normalized_selection();
+                                                r.long_press_origin_pos = Some(lp_pos);
+                                                r.long_press_dragged = false;
                                                 r.page_touch_mode =
                                                     Some(PageTouchMode::LongPressSelecting);
                                                 r.is_long_press_selecting = true;
@@ -1762,9 +1871,13 @@ pub fn render_reader_view(
                                     };
                                     match r.page_touch_mode {
                                         Some(PageTouchMode::HandleDrag(kind)) => {
+                                            let test_pos = point(
+                                                ev.position.x,
+                                                ev.position.y - px(r.handle_drag_offset_y),
+                                            );
                                             if r.update_handle_drag_at(
                                                 kind,
-                                                ev.position,
+                                                test_pos,
                                                 Some(bounds),
                                                 last_c,
                                                 last_s,
@@ -1773,12 +1886,37 @@ pub fn render_reader_view(
                                             }
                                         }
                                         Some(PageTouchMode::LongPressSelecting) => {
+                                            if !r.long_press_dragged {
+                                                let moved =
+                                                    r.long_press_origin_pos.is_some_and(|orig| {
+                                                        let dx =
+                                                            f32::from(ev.position.x - orig.x);
+                                                        let dy =
+                                                            f32::from(ev.position.y - orig.y);
+                                                        dx * dx + dy * dy >= 64.0
+                                                    });
+                                                if !moved {
+                                                    return;
+                                                }
+                                                r.long_press_dragged = true;
+                                            }
                                             if let Some(hit) =
                                                 r.hit_test_position(ev.position, Some(bounds))
-                                                && r.selection_head != Some(hit)
+                                                && let Some(anchor_word) =
+                                                    r.long_press_anchor_word
                                             {
-                                                r.selection_head = Some(hit);
-                                                cx.notify();
+                                                let (new_a, new_h) =
+                                                    super::extend_long_press_selection(
+                                                        anchor_word,
+                                                        hit,
+                                                    );
+                                                if r.selection_anchor != Some(new_a)
+                                                    || r.selection_head != Some(new_h)
+                                                {
+                                                    r.selection_anchor = Some(new_a);
+                                                    r.selection_head = Some(new_h);
+                                                    cx.notify();
+                                                }
                                             }
                                         }
                                         Some(PageTouchMode::Pending) => {
@@ -1890,6 +2028,9 @@ pub fn render_reader_view(
                                         Some(PageTouchMode::LongPressSelecting) => {
                                             if let Some(r) = &mut app.reader {
                                                 r.is_long_press_selecting = false;
+                                                r.long_press_anchor_word = None;
+                                                r.long_press_origin_pos = None;
+                                                r.long_press_dragged = false;
                                             }
                                             app.reader_finalize_selection_draft(window, cx);
                                         }
@@ -1995,30 +2136,6 @@ pub fn render_reader_view(
                 },
             )
             .size_full();
-
-            let (start_handle_pt, end_handle_pt) = handle_points;
-            let handle_overlay = |pt_opt: Option<Point<Pixels>>, is_start: bool| -> Option<AnyElement> {
-                let pt = pt_opt?;
-                let rel_x = (f32::from(pt.x - vp_bounds.origin.x) - 8.0)
-                    .clamp(2.0, (f32::from(vp_bounds.size.width) - 18.0).max(2.0));
-                let rel_y = (f32::from(pt.y - vp_bounds.origin.y) + 2.0)
-                    .clamp(2.0, (f32::from(vp_bounds.size.height) - 24.0).max(2.0));
-                Some(
-                    div()
-                        .absolute()
-                        .left(px(rel_x))
-                        .top(px(rel_y))
-                        .w(px(16.))
-                        .h(px(22.))
-                        .rounded(px(8.))
-                        .bg(hex_color(pal.accent))
-                        .border_2()
-                        .border_color(hex_color(0xffffff))
-                        .when(is_start, |d| d.rounded_tr(px(2.)))
-                        .when(!is_start, |d| d.rounded_tl(px(2.)))
-                        .into_any_element(),
-                )
-            };
 
             let progress = (visual_swipe_x.abs() / vp_w_cur).clamp(0.0, 1.0);
             let spine_overlay = |edge_x: f32, veil_alpha: u32| -> AnyElement {
@@ -2188,8 +2305,6 @@ pub fn render_reader_view(
                 )
                 .child(layered_pages)
                 .child(div().absolute().inset_0().child(page_touch_canvas))
-                .when_some(handle_overlay(start_handle_pt, true), |el, h| el.child(h))
-                .when_some(handle_overlay(end_handle_pt, false), |el, h| el.child(h))
                 .into_any_element()
         }
     };
@@ -2201,6 +2316,29 @@ pub fn render_reader_view(
         app.safe_area.bottom.max(kb_height)
     } else {
         (48.0 + app.safe_area.bottom).max(kb_height)
+    };
+    let draft_sheet_top = if zen_mode { 8.0 } else { 52.0 };
+    let dock_top = if draft.is_some() {
+        let (sg, eg) = r.selection_handle_geometries(vp_bounds);
+        let sel_mid_y = match (sg, eg) {
+            (Some((sp, _)), Some((ep, elh))) => Some((f32::from(sp.y) + f32::from(ep.y) + elh) * 0.5),
+            (Some((p, lh)), None) | (None, Some((p, lh))) => Some(f32::from(p.y) + lh * 0.5),
+            (None, None) => None,
+        };
+        let dock = resolve_draft_dock_top(
+            sel_mid_y,
+            f32::from(vp_bounds.origin.y),
+            f32::from(vp_bounds.size.height),
+            r.draft_dock_top.get(),
+            r.draft_dock_initialized.get(),
+        );
+        if sel_mid_y.is_some() {
+            r.draft_dock_top.set(dock);
+            r.draft_dock_initialized.set(true);
+        }
+        dock
+    } else {
+        false
     };
     let dict_lookup_state = r.dict_lookup.clone();
     let draft_bounds_tracker = draft_sheet_bounds_ref.clone();
@@ -2343,9 +2481,9 @@ pub fn render_reader_view(
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(draft_sheet_bottom))
+            .when(dock_top, |d| d.top(px(draft_sheet_top)).pt_1())
+            .when(!dock_top, |d| d.bottom(px(draft_sheet_bottom)).pb_1())
             .px_2()
-            .pb_1()
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2606,8 +2744,27 @@ pub fn render_reader_view(
 mod tests {
     use super::{
         BookHighlight, EpubBlock, EpubRun, HighlightColor, HighlightDecoration, edge_tap_direction,
-        flatten_block_highlights, hex_color, split_blocks_two_columns,
+        flatten_block_highlights, hex_color, resolve_draft_dock_top, split_blocks_two_columns,
     };
+
+    #[test]
+    fn draft_dock_top_picks_opposite_half_with_hysteresis() {
+        // Upper half -> dock bottom (false); lower half -> dock top (true)
+        assert!(!resolve_draft_dock_top(Some(150.0), 50.0, 600.0, false, false));
+        assert!(resolve_draft_dock_top(Some(450.0), 50.0, 600.0, false, false));
+
+        // Viewport midpoint is 50 + 300 = 350; hysteresis band [330, 370] preserves prior side
+        assert!(resolve_draft_dock_top(Some(335.0), 50.0, 600.0, true, true));
+        assert!(!resolve_draft_dock_top(Some(335.0), 50.0, 600.0, false, true));
+        // Crossing past hysteresis flips dock side
+        assert!(!resolve_draft_dock_top(Some(320.0), 50.0, 600.0, true, true));
+        assert!(resolve_draft_dock_top(Some(375.0), 50.0, 600.0, false, true));
+
+        // Zero-height viewport and missing selection default safely
+        assert!(!resolve_draft_dock_top(Some(200.0), 0.0, 0.0, true, true));
+        assert!(!resolve_draft_dock_top(None, 50.0, 600.0, false, false));
+        assert!(resolve_draft_dock_top(None, 50.0, 600.0, true, true));
+    }
 
     #[test]
     fn edge_tap_direction_splits_left_center_and_right() {
