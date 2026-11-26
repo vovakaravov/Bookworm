@@ -4,7 +4,7 @@ pub mod reader_view;
 pub mod settings_view;
 
 use crate::config::{
-    BookwormMobileConfig, app_cache_dir, app_storage_dir, books_root_candidates,
+    BookwormMobileConfig, LibraryGridSize, app_cache_dir, app_storage_dir, books_root_candidates,
     default_books_root, has_external_storage_access, state_root_for,
 };
 use crate::theme::ReaderTheme;
@@ -19,7 +19,6 @@ use bookworm_core::library::{
 use bookworm_core::{can_read_dir, count_direct_matching_files, list_subdirectories};
 use gpui::{prelude::*, *};
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::{Icon, IconName, h_flex};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
@@ -580,6 +579,7 @@ pub struct BookwormMobileApp {
     pub reader_width: ReaderWidthPref,
     pub reader_pagination: ReaderPaginationPref,
     pub two_column_spread: bool,
+    pub library_grid_size: LibraryGridSize,
     pub status_banner: Option<String>,
 
     pub library_search_input: Entity<InputState>,
@@ -922,6 +922,7 @@ impl BookwormMobileApp {
             reader_width,
             reader_pagination,
             two_column_spread: cfg.two_column_spread,
+            library_grid_size: cfg.library_grid_size,
             status_banner: initial_banner,
             library_search_input,
             highlight_note_input,
@@ -971,12 +972,21 @@ impl BookwormMobileApp {
         let cfg = BookwormMobileConfig {
             books_root: Some(self.books_root.clone()),
             two_column_spread: self.two_column_spread,
+            library_grid_size: self.library_grid_size,
         };
         cx.background_executor()
             .spawn(async move {
                 let _ = cfg.save();
             })
             .detach();
+    }
+
+    pub fn set_library_grid_size(&mut self, size: LibraryGridSize, cx: &mut Context<Self>) {
+        if self.library_grid_size != size {
+            self.library_grid_size = size;
+            self.persist_mobile_config(cx);
+            cx.notify();
+        }
     }
 
     pub fn most_recent_in_progress_book(&self) -> Option<&BookRecord> {
@@ -1243,28 +1253,6 @@ impl BookwormMobileApp {
         gpui_mobile::hide_keyboard();
         self.surface = AppSurface::Library;
         cx.notify();
-    }
-
-    pub fn open_surface_reader_or_resume(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.reader.is_some() {
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
-            self.surface = AppSurface::Reader;
-            cx.notify();
-            return;
-        }
-        if let Some(rel) = self
-            .last_opened_rel
-            .clone()
-            .or_else(|| self.most_recent_in_progress_book().map(|b| b.rel_path.clone()))
-            .or_else(|| self.books.first().map(|b| b.rel_path.clone()))
-        {
-            self.open_book(&rel, window, cx);
-        }
     }
 
     pub fn open_surface_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2569,44 +2557,6 @@ impl BookwormMobileApp {
     }
 }
 
-fn nav_tab_item(
-    id: &'static str,
-    icon: IconName,
-    label: &'static str,
-    active: bool,
-    disabled: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let fg = if disabled {
-        crate::theme::kd::FG_MUTED
-    } else if active {
-        crate::theme::kd::GREEN
-    } else {
-        crate::theme::kd::FG_SUBTLE
-    };
-    div()
-        .id(id)
-        .flex_1()
-        .h(px(48.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap_1p5()
-        .when(!disabled, |el| el.cursor_pointer().on_click(on_click))
-        .child(Icon::new(icon).size(px(16.)).text_color(crate::theme::hex_color(fg)))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(crate::theme::hex_color(fg))
-                .child(label),
-        )
-}
-
 impl Render for BookwormMobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let epoch = crate::android_resume_epoch();
@@ -2637,12 +2587,6 @@ impl Render for BookwormMobileApp {
                 settings_view::render_settings_tab(self, cx).into_any_element()
             }
         };
-
-        let can_open_reader = self.reader.is_some()
-            || self.most_recent_in_progress_book().is_some()
-            || !self.books.is_empty();
-
-        let show_bottom_nav = self.surface != AppSurface::Reader;
 
         div()
             .image_cache(self.image_cache.clone())
@@ -2677,57 +2621,6 @@ impl Render for BookwormMobileApp {
                             .flex_col()
                             .child(body),
                     )
-                    .when(show_bottom_nav, |col| {
-                        col.child(
-                            h_flex()
-                                .w_full()
-                                .flex_shrink_0()
-                                .bg(crate::theme::hex_color(crate::theme::kd::BG_DEEP))
-                                .border_t_1()
-                                .border_color(crate::theme::hex_color(
-                                    crate::theme::kd::BORDER_SUBTLE,
-                                ))
-                                .child(nav_tab_item(
-                                    "nav-library",
-                                    IconName::Folder,
-                                    "Library",
-                                    self.surface == AppSurface::Library,
-                                    false,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_surface_library(window, cx);
-                                    }),
-                                ))
-                                .child(nav_tab_item(
-                                    "nav-reader",
-                                    IconName::BookOpen,
-                                    "Reader",
-                                    self.surface == AppSurface::Reader,
-                                    !can_open_reader,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_surface_reader_or_resume(window, cx);
-                                    }),
-                                ))
-                                .child(nav_tab_item(
-                                    "nav-settings",
-                                    IconName::Settings,
-                                    "Settings",
-                                    self.surface == AppSurface::Settings,
-                                    false,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_surface_settings(window, cx);
-                                    }),
-                                )),
-                        )
-                        .when(self.safe_area.bottom > 0.0, |c| {
-                            c.child(
-                                div()
-                                    .w_full()
-                                    .h(px(self.safe_area.bottom))
-                                    .flex_shrink_0()
-                                    .bg(crate::theme::hex_color(crate::theme::kd::BG_DEEP)),
-                            )
-                        })
-                    })
                     .when(self.book_context_menu.is_some(), |frame| {
                         frame.child(library_view::render_book_context_menu(self, cx))
                     })

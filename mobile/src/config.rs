@@ -63,11 +63,50 @@ pub fn books_root_candidates(current: &Path) -> Vec<(String, PathBuf)> {
     discover_books_root_candidates(current, &app_storage_dir("books"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LibraryGridSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl LibraryGridSize {
+    pub fn all() -> &'static [LibraryGridSize] {
+        &[Self::Small, Self::Medium, Self::Large]
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Small => "S",
+            Self::Medium => "M",
+            Self::Large => "L",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "Small",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Small => "sm",
+            Self::Medium => "md",
+            Self::Large => "lg",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BookwormMobileConfig {
     pub books_root: Option<PathBuf>,
     pub two_column_spread: bool,
+    pub library_grid_size: LibraryGridSize,
 }
 
 impl Default for BookwormMobileConfig {
@@ -75,6 +114,7 @@ impl Default for BookwormMobileConfig {
         Self {
             books_root: None,
             two_column_spread: true,
+            library_grid_size: LibraryGridSize::Medium,
         }
     }
 }
@@ -110,10 +150,12 @@ mod tests {
         let cfg = BookwormMobileConfig {
             books_root: Some(PathBuf::from("/sdcard/Documents/Library")),
             two_column_spread: false,
+            library_grid_size: LibraryGridSize::Large,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: BookwormMobileConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.books_root, cfg.books_root);
         assert!(!back.two_column_spread);
+        assert_eq!(back.library_grid_size, LibraryGridSize::Large);
     }
 }

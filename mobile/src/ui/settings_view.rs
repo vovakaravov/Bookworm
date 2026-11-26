@@ -1,5 +1,5 @@
 use super::BookwormMobileApp;
-use crate::config::app_storage_dir;
+use crate::config::{LibraryGridSize, app_storage_dir};
 use crate::theme::{ReaderTheme, accent_alpha, hex_alpha, hex_color, kd};
 use bookworm_core::can_read_dir;
 use gpui::{prelude::*, *};
@@ -160,6 +160,47 @@ pub fn render_settings_tab(
             cx,
         ));
     }
+
+    let library_card = v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_2()
+        .rounded(px(12.))
+        .bg(hex_color(kd::BG_SIDEBAR))
+        .border_1()
+        .border_color(hex_color(kd::BORDER_SUBTLE))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(hex_color(kd::FG))
+                .child("Library Grid Size"),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(hex_color(kd::FG_SUBTLE))
+                .child("Adjust book cover size & columns in Library view."),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_1p5()
+                .children(LibraryGridSize::all().iter().copied().map(|sz| {
+                    let active = app.library_grid_size == sz;
+                    Button::new(SharedString::from(format!("set-lib-grid-{}", sz.key())))
+                        .with_variant(if active {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        })
+                        .small()
+                        .label(sz.label())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_library_grid_size(sz, cx);
+                        }))
+                })),
+        );
 
     let export_dir = app.books_root.join("Bookworm Notes");
     let export_card = v_flex()
@@ -400,8 +441,10 @@ pub fn render_settings_tab(
     let body = v_flex()
         .w_full()
         .p_3p5()
+        .pb(px(app.safe_area.bottom + 24.0))
         .gap_3()
         .child(books_card)
+        .child(library_card)
         .child(export_card)
         .child(reader_card)
         .child(storage_card);

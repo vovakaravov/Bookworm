@@ -1,4 +1,5 @@
 use super::{BookwormMobileApp, LibraryFilter};
+use crate::config::LibraryGridSize;
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use bookworm_core::library::{BookRecord, ReadingStatus};
 use gpui::{prelude::*, *};
@@ -60,104 +61,132 @@ fn lib_header_icon_btn(
         .child(lib_icon(icon, 16., kd::FG))
 }
 
-pub fn compute_library_cols(viewport_width: f32, safe_left: f32, safe_right: f32) -> usize {
+pub fn compute_library_cols(
+    viewport_width: f32,
+    safe_left: f32,
+    safe_right: f32,
+    grid_size: LibraryGridSize,
+) -> usize {
     let avail = (viewport_width - safe_left - safe_right).max(320.0);
-    if avail >= 900.0 {
-        4
-    } else if avail >= 600.0 {
-        3
-    } else {
-        2
+    match grid_size {
+        LibraryGridSize::Small => {
+            if avail >= 900.0 {
+                6
+            } else if avail >= 600.0 {
+                4
+            } else {
+                3
+            }
+        }
+        LibraryGridSize::Medium => {
+            if avail >= 900.0 {
+                4
+            } else if avail >= 600.0 {
+                3
+            } else {
+                2
+            }
+        }
+        LibraryGridSize::Large => {
+            if avail >= 900.0 {
+                3
+            } else if avail >= 600.0 {
+                2
+            } else {
+                1
+            }
+        }
     }
 }
 
-fn render_continue_reading_hero(
+fn render_continue_reading_dock(
     book: &BookRecord,
+    safe_bottom: f32,
     cx: &mut Context<BookwormMobileApp>,
 ) -> impl IntoElement {
     let rel = book.rel_path.clone();
     let rel_lp = book.rel_path.clone();
-    let app_weak_hero = cx.entity().downgrade();
+    let app_weak_dock = cx.entity().downgrade();
     let title = book.display_title().to_string();
-    let author = book.authors_display();
     let pct = book.progress_pct();
     let hl_count = book.user.highlights.len();
     let total_ch = book.user.total_chapters.max(book.chapter_count).max(1);
-    let progress_line = if hl_count > 0 {
+    let subtitle = if hl_count > 0 {
         format!(
-            "Ch {} / {} · {}% · ★{}",
+            "Continue · Ch {} / {} · {}% · ★{}",
             book.user.chapter_idx + 1,
             total_ch,
             pct,
             hl_count
         )
     } else {
-        format!("Ch {} / {} · {}%", book.user.chapter_idx + 1, total_ch, pct)
+        format!(
+            "Continue · Ch {} / {} · {}%",
+            book.user.chapter_idx + 1,
+            total_ch,
+            pct
+        )
     };
 
     let thumb = if let Some(cov) = &book.cover_cache_path {
         div()
-            .w(px(58.))
-            .h(px(84.))
-            .rounded(px(7.))
+            .w(px(30.))
+            .h(px(42.))
+            .rounded(px(4.))
             .overflow_hidden()
             .flex_shrink_0()
             .bg(hex_color(kd::BG_PANEL))
             .child(img(cov.clone()).size_full().object_fit(ObjectFit::Cover))
             .into_any_element()
     } else {
-        v_flex()
-            .w(px(58.))
-            .h(px(84.))
-            .p_1p5()
-            .justify_between()
+        div()
+            .w(px(30.))
+            .h(px(42.))
+            .rounded(px(4.))
             .flex_shrink_0()
-            .rounded(px(7.))
             .bg(hex_color(kd::BG_PANEL))
             .border_1()
             .border_color(hex_color(kd::GREEN))
+            .flex()
+            .items_center()
+            .justify_center()
             .child(lib_icon(IconName::BookOpen, 14., kd::GREEN))
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(hex_color(kd::FG))
-                    .truncate()
-                    .child(title.clone()),
-            )
             .into_any_element()
     };
 
     v_flex()
         .w_full()
-        .px_3()
-        .pt_3()
-        .gap_1p5()
+        .flex_shrink_0()
+        .bg(hex_color(kd::BG_DEEP))
+        .border_t_1()
+        .border_color(hex_color(kd::BORDER))
         .child(
             div()
-                .text_size(px(10.5))
-                .font_weight(FontWeight::BOLD)
-                .text_color(hex_color(kd::GREEN))
-                .child("CONTINUE READING"),
+                .w_full()
+                .h(px(2.5))
+                .bg(hex_color(kd::BG_PANEL))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(pct as f32 / 100.0))
+                        .bg(hex_color(kd::GREEN)),
+                ),
         )
         .child(
             h_flex()
-                .id("lib-continue-hero")
+                .id("lib-continue-dock")
                 .relative()
                 .w_full()
-                .p_3()
-                .gap_3()
+                .px_3()
+                .py_2()
+                .gap_2p5()
                 .items_center()
-                .rounded(px(12.))
-                .bg(hex_color(kd::BG_SIDEBAR))
-                .border_1()
-                .border_color(hex_color(kd::BORDER))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_book(&rel, window, cx);
                 }))
                 .child(long_press_overlay(move |_, window, cx| {
-                    let _ = app_weak_hero.update(cx, |this, cx| {
+                    let _ = app_weak_dock.update(cx, |this, cx| {
                         this.open_book_context_menu(rel_lp.clone(), window, cx);
                     });
                 }))
@@ -166,10 +195,10 @@ fn render_continue_reading_hero(
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .gap_1()
+                        .gap_0p5()
                         .child(
                             div()
-                                .text_sm()
+                                .text_xs()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hex_color(kd::FG))
                                 .truncate()
@@ -177,50 +206,42 @@ fn render_continue_reading_hero(
                         )
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(hex_color(kd::FG_SUBTLE))
-                                .truncate()
-                                .child(author),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.))
+                                .text_size(px(10.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(hex_color(kd::GREEN))
-                                .child(progress_line),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(4.))
-                                .rounded(px(2.))
-                                .bg(hex_color(kd::BG_PANEL))
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .w(relative(pct as f32 / 100.0))
-                                        .rounded(px(2.))
-                                        .bg(hex_color(kd::GREEN)),
-                                ),
+                                .truncate()
+                                .child(subtitle),
                         ),
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .px_2p5()
-                        .py_1p5()
-                        .rounded(px(8.))
+                        .py_1()
+                        .rounded(px(7.))
                         .bg(hex_color(kd::GREEN))
-                        .text_xs()
+                        .text_size(px(11.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(hex_color(kd::BG_MAIN))
                         .child("Resume"),
                 ),
         )
+        .when(safe_bottom > 0.0, |col| {
+            col.child(
+                div()
+                    .w_full()
+                    .h(px(safe_bottom))
+                    .flex_shrink_0()
+                    .bg(hex_color(kd::BG_DEEP)),
+            )
+        })
 }
 
 fn render_book_card_in_row(
     book: &BookRecord,
     ix: usize,
+    grid_size: LibraryGridSize,
+    cols: usize,
     app_weak: AnyWeakEntity,
 ) -> impl IntoElement {
     let rel = book.rel_path.clone();
@@ -232,6 +253,7 @@ fn render_book_card_in_row(
     let pct = book.progress_pct();
     let hl_count = book.user.highlights.len();
     let status = book.user.status;
+    let total_ch = book.user.total_chapters.max(book.chapter_count).max(1);
 
     let (status_bg, status_fg) = match status {
         ReadingStatus::Reading => (hex_alpha(0x87a98728), kd::GREEN),
@@ -240,10 +262,161 @@ fn render_book_card_in_row(
         ReadingStatus::Unread => (hex_alpha(0x72716924), kd::FG_MUTED),
     };
 
+    let pct_str = if hl_count > 0 {
+        format!("{pct}% · ★{hl_count}")
+    } else {
+        format!("{pct}%")
+    };
+
+    if cols == 1 {
+        let cover_el = if let Some(cov) = &book.cover_cache_path {
+            div()
+                .w(px(84.))
+                .h(px(124.))
+                .rounded(px(8.))
+                .overflow_hidden()
+                .flex_shrink_0()
+                .bg(hex_color(kd::BG_PANEL))
+                .child(img(cov.clone()).size_full().object_fit(ObjectFit::Cover))
+                .into_any_element()
+        } else {
+            v_flex()
+                .w(px(84.))
+                .h(px(124.))
+                .p_2()
+                .justify_between()
+                .flex_shrink_0()
+                .rounded(px(8.))
+                .bg(hex_color(kd::BG_PANEL))
+                .border_1()
+                .border_color(hex_color(kd::BORDER))
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(hex_color(kd::GREEN))
+                        .child("EPUB"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(hex_color(kd::FG))
+                        .truncate()
+                        .child(title.clone()),
+                )
+                .into_any_element()
+        };
+
+        return div()
+            .id(SharedString::from(format!("book-card-{ix}")))
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .p_2p5()
+            .rounded(px(12.))
+            .bg(hex_color(kd::BG_SIDEBAR))
+            .border_1()
+            .border_color(hex_color(kd::BORDER_SUBTLE))
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .on_click(move |_, window, cx| {
+                if let Some(any_ent) = weak_click.upgrade()
+                    && let Ok(ent) = any_ent.downcast::<BookwormMobileApp>()
+                {
+                    ent.update(cx, |this, cx| {
+                        this.open_book(&rel, window, cx);
+                    });
+                }
+            })
+            .child(long_press_overlay(move |_, window, cx| {
+                if let Some(any_ent) = weak_lp.upgrade()
+                    && let Ok(ent) = any_ent.downcast::<BookwormMobileApp>()
+                {
+                    ent.update(cx, |this, cx| {
+                        this.open_book_context_menu(rel_lp.clone(), window, cx);
+                    });
+                }
+            }))
+            .child(cover_el)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(hex_color(kd::FG))
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hex_color(kd::FG_SUBTLE))
+                            .truncate()
+                            .child(author),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(hex_color(kd::FG_MUTED))
+                            .child(format!(
+                                "Ch {} / {} · {pct_str}",
+                                book.user.chapter_idx + 1,
+                                total_ch
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(5.))
+                                    .bg(status_bg)
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hex_color(status_fg))
+                                    .child(status.label()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(3.5))
+                                    .rounded(px(2.))
+                                    .bg(hex_color(kd::BG_PANEL))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(pct as f32 / 100.0))
+                                            .rounded(px(2.))
+                                            .bg(hex_color(kd::GREEN)),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element();
+    }
+
+    let (cover_h, compact_meta) = match grid_size {
+        LibraryGridSize::Small => (if cols >= 4 { 150.0 } else { 136.0 }, true),
+        LibraryGridSize::Medium => (if cols >= 3 { 198.0 } else { 188.0 }, false),
+        LibraryGridSize::Large => (236.0, false),
+    };
+
     let cover_el = if let Some(cov) = &book.cover_cache_path {
         div()
             .w_full()
-            .h(px(196.))
+            .h(px(cover_h))
             .rounded(px(8.))
             .overflow_hidden()
             .bg(hex_color(kd::BG_PANEL))
@@ -252,8 +425,8 @@ fn render_book_card_in_row(
     } else {
         v_flex()
             .w_full()
-            .h(px(196.))
-            .p_3()
+            .h(px(cover_h))
+            .p_2p5()
             .justify_between()
             .rounded(px(8.))
             .bg(hex_color(kd::BG_PANEL))
@@ -268,17 +441,18 @@ fn render_book_card_in_row(
             )
             .child(
                 v_flex()
-                    .gap_1()
+                    .gap_0p5()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(if compact_meta { 12. } else { 13.5 }))
                             .font_weight(FontWeight::BOLD)
                             .text_color(hex_color(kd::FG))
+                            .truncate()
                             .child(title.clone()),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(if compact_meta { 10.5 } else { 11.5 }))
                             .text_color(hex_color(kd::FG_SUBTLE))
                             .truncate()
                             .child(author.clone()),
@@ -292,7 +466,7 @@ fn render_book_card_in_row(
         .relative()
         .flex_1()
         .min_w_0()
-        .p_2p5()
+        .p(px(if compact_meta { 6. } else { 10. }))
         .rounded(px(12.))
         .bg(hex_color(kd::BG_SIDEBAR))
         .border_1()
@@ -300,7 +474,7 @@ fn render_book_card_in_row(
         .cursor_pointer()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap(px(if compact_meta { 5. } else { 8. }))
         .on_click(move |_, window, cx| {
             if let Some(any_ent) = weak_click.upgrade()
                 && let Ok(ent) = any_ent.downcast::<BookwormMobileApp>()
@@ -326,7 +500,7 @@ fn render_book_card_in_row(
                 .gap_0p5()
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(px(if compact_meta { 11.5 } else { 13.5 }))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(hex_color(kd::FG))
                         .truncate()
@@ -334,7 +508,7 @@ fn render_book_card_in_row(
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(if compact_meta { 10. } else { 11.5 }))
                         .text_color(hex_color(kd::FG_SUBTLE))
                         .truncate()
                         .child(author),
@@ -352,20 +526,16 @@ fn render_book_card_in_row(
                         .py_0p5()
                         .rounded(px(5.))
                         .bg(status_bg)
-                        .text_size(px(10.))
+                        .text_size(px(if compact_meta { 9. } else { 10. }))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(hex_color(status_fg))
                         .child(status.label()),
                 )
                 .child(
                     div()
-                        .text_size(px(10.5))
+                        .text_size(px(if compact_meta { 9.5 } else { 10.5 }))
                         .text_color(hex_color(kd::FG_MUTED))
-                        .child(if hl_count > 0 {
-                            format!("{pct}% · ★{hl_count}")
-                        } else {
-                            format!("{pct}%")
-                        }),
+                        .child(pct_str),
                 ),
         )
         .child(
@@ -382,6 +552,7 @@ fn render_book_card_in_row(
                         .bg(hex_color(kd::GREEN)),
                 ),
         )
+        .into_any_element()
 }
 
 pub fn render_library_tab(
@@ -423,10 +594,12 @@ pub fn render_library_tab(
         None
     };
 
+    let grid_size = app.library_grid_size;
     let cols = compute_library_cols(
         f32::from(window.viewport_size().width),
         app.safe_area.left,
         app.safe_area.right,
+        grid_size,
     );
 
     let books_root_display = app.books_root.display().to_string();
@@ -434,7 +607,7 @@ pub fn render_library_tab(
     let header = h_flex()
         .w_full()
         .px_3()
-        .py_2p5()
+        .py_2()
         .bg(hex_color(kd::BG_DEEP))
         .border_b_1()
         .border_color(hex_color(kd::BORDER_SUBTLE))
@@ -449,8 +622,8 @@ pub fn render_library_tab(
                 .gap_2()
                 .child(
                     div()
-                        .w(px(32.))
-                        .h(px(32.))
+                        .w(px(30.))
+                        .h(px(30.))
                         .rounded(px(8.))
                         .bg(hex_alpha(0x87a98728))
                         .border_1()
@@ -459,7 +632,7 @@ pub fn render_library_tab(
                         .items_center()
                         .justify_center()
                         .flex_shrink_0()
-                        .child(lib_icon(IconName::BookOpen, 16., kd::GREEN)),
+                        .child(lib_icon(IconName::BookOpen, 15., kd::GREEN)),
                 )
                 .child(
                     v_flex()
@@ -467,7 +640,7 @@ pub fn render_library_tab(
                         .min_w_0()
                         .child(
                             div()
-                                .text_base()
+                                .text_sm()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(hex_color(kd::FG))
                                 .truncate()
@@ -475,7 +648,7 @@ pub fn render_library_tab(
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(10.5))
                                 .text_color(hex_color(kd::FG_SUBTLE))
                                 .child(if app.library_scanning {
                                     "Scanning for EPUBs…".to_string()
@@ -489,13 +662,6 @@ pub fn render_library_tab(
             h_flex()
                 .gap_1p5()
                 .flex_shrink_0()
-                .child(lib_header_icon_btn(
-                    "lib-pick-root",
-                    IconName::Folder,
-                    cx.listener(|this, _, window, cx| {
-                        this.open_folder_picker(window, cx);
-                    }),
-                ))
                 .child(lib_header_icon_btn(
                     "lib-refresh",
                     IconName::RefreshCw,
@@ -512,67 +678,11 @@ pub fn render_library_tab(
                 )),
         );
 
-    let root_bar = div()
-        .id("lib-root-strip")
-        .w_full()
-        .px_3()
-        .py_2()
-        .bg(hex_color(kd::BG_SIDEBAR))
-        .border_b_1()
-        .border_color(hex_color(kd::BORDER_SUBTLE))
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.open_folder_picker(window, cx);
-        }))
-        .child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .child(lib_icon(IconName::Folder, 14., kd::GREEN))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(hex_color(kd::FG_MUTED))
-                                .child("BOOKS ROOT"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(hex_color(kd::FG))
-                                .truncate()
-                                .child(books_root_display.clone()),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .px_2()
-                .py_1()
-                .rounded(px(6.))
-                .flex_shrink_0()
-                .bg(accent_alpha(0x2e))
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(hex_color(kd::ACCENT_HOVER))
-                .child("Change"),
-        );
-
     let controls = v_flex()
         .w_full()
         .px_3()
-        .py_2()
-        .gap_2()
+        .py_1p5()
+        .gap_1p5()
         .bg(hex_color(kd::BG_SIDEBAR))
         .border_b_1()
         .border_color(hex_color(kd::BORDER_SUBTLE))
@@ -580,33 +690,81 @@ pub fn render_library_tab(
         .child(
             h_flex()
                 .w_full()
+                .items_center()
+                .justify_between()
                 .gap_1p5()
-                .children(LibraryFilter::all().iter().copied().map(|f| {
-                    let active = app.library_filter == f;
-                    div()
-                        .id(SharedString::from(format!("lib-flt-{}", f.label())))
-                        .px_2p5()
-                        .py_1()
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .children(LibraryFilter::all().iter().copied().map(|f| {
+                            let active = app.library_filter == f;
+                            div()
+                                .id(SharedString::from(format!("lib-flt-{}", f.label())))
+                                .px_2()
+                                .py_1()
+                                .rounded(px(7.))
+                                .cursor_pointer()
+                                .bg(hex_color(if active {
+                                    kd::GREEN
+                                } else {
+                                    kd::BG_PANEL
+                                }))
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hex_color(if active {
+                                    kd::BG_MAIN
+                                } else {
+                                    kd::FG_SUBTLE
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.library_filter = f;
+                                    cx.notify();
+                                }))
+                                .child(f.label())
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .id("lib-grid-size-group")
+                        .flex_shrink_0()
+                        .p_0p5()
                         .rounded(px(8.))
-                        .cursor_pointer()
-                        .bg(hex_color(if active {
-                            kd::GREEN
-                        } else {
-                            kd::BG_PANEL
-                        }))
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(hex_color(if active {
-                            kd::BG_MAIN
-                        } else {
-                            kd::FG_SUBTLE
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.library_filter = f;
-                            cx.notify();
-                        }))
-                        .child(f.label())
-                })),
+                        .bg(hex_color(kd::BG_PANEL))
+                        .border_1()
+                        .border_color(hex_color(kd::BORDER_SUBTLE))
+                        .gap_0p5()
+                        .children(LibraryGridSize::all().iter().copied().map(|sz| {
+                            let active = grid_size == sz;
+                            div()
+                                .id(SharedString::from(format!("lib-grid-size-{}", sz.key())))
+                                .min_w(px(24.))
+                                .h(px(24.))
+                                .px_1p5()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if active {
+                                    accent_alpha(0x3a)
+                                } else {
+                                    gpui::transparent_black()
+                                })
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hex_color(if active {
+                                    kd::ACCENT_HOVER
+                                } else {
+                                    kd::FG_MUTED
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_library_grid_size(sz, cx);
+                                }))
+                                .child(sz.short_label())
+                        })),
+                ),
         );
 
     let grid = if filtered.is_empty() {
@@ -675,57 +833,52 @@ pub fn render_library_tab(
         let books_rc: Rc<Vec<BookRecord>> = Rc::new(filtered.into_iter().cloned().collect());
         let row_count = (books_rc.len() + cols - 1) / cols;
         let app_weak_grid: AnyWeakEntity = cx.entity().downgrade().into();
+        let list_id = SharedString::from(format!("library-book-rows-{}-{cols}", grid_size.key()));
 
-        v_flex()
+        div()
+            .relative()
             .size_full()
-            .when_some(continue_book, |col, hero| {
-                col.child(render_continue_reading_hero(&hero, cx))
-            })
+            .pt_2()
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .pt_2()
-                    .child(
-                        uniform_list("library-book-rows", row_count, move |range, _, _| {
-                            range
-                                .map(|row_ix| {
-                                    let start = row_ix * cols;
-                                    let end = (start + cols).min(books_rc.len());
-                                    let mut row = h_flex()
-                                        .w_full()
-                                        .px_3()
-                                        .pb_3()
-                                        .gap_2p5()
-                                        .items_stretch();
-                                    for ix in start..end {
-                                        row = row.child(render_book_card_in_row(
-                                            &books_rc[ix],
-                                            ix,
-                                            app_weak_grid.clone(),
-                                        ));
-                                    }
-                                    for _ in (end - start)..cols {
-                                        row = row.child(div().flex_1());
-                                    }
-                                    row
-                                })
-                                .collect()
+                uniform_list(list_id, row_count, move |range, _, _| {
+                    range
+                        .map(|row_ix| {
+                            let start = row_ix * cols;
+                            let end = (start + cols).min(books_rc.len());
+                            let mut row = h_flex()
+                                .w_full()
+                                .px_3()
+                                .pb_2p5()
+                                .gap_2()
+                                .items_stretch();
+                            for ix in start..end {
+                                row = row.child(render_book_card_in_row(
+                                    &books_rc[ix],
+                                    ix,
+                                    grid_size,
+                                    cols,
+                                    app_weak_grid.clone(),
+                                ));
+                            }
+                            for _ in (end - start)..cols {
+                                row = row.child(div().flex_1());
+                            }
+                            row
                         })
-                        .size_full()
-                        .track_scroll(&app.library_rows_scroll),
-                    )
-                    .child(Scrollbar::vertical(&app.library_rows_scroll)),
+                        .collect()
+                })
+                .size_full()
+                .track_scroll(&app.library_rows_scroll),
             )
+            .child(Scrollbar::vertical(&app.library_rows_scroll))
             .into_any_element()
     };
+
+    let has_continue = continue_book.is_some();
 
     v_flex()
         .size_full()
         .child(header)
-        .child(root_bar)
         .when(!app.has_storage_access, |col| {
             col.child(
                 h_flex()
@@ -801,6 +954,12 @@ pub fn render_library_tab(
                 .w_full()
                 .child(grid),
         )
+        .when_some(continue_book.as_ref(), |col, hero| {
+            col.child(render_continue_reading_dock(hero, app.safe_area.bottom, cx))
+        })
+        .when(!has_continue && app.safe_area.bottom > 0.0, |col| {
+            col.child(div().w_full().h(px(app.safe_area.bottom)).flex_shrink_0())
+        })
 }
 
 fn book_menu_action_row(
@@ -1014,11 +1173,47 @@ pub fn render_book_context_menu(
 #[cfg(test)]
 mod tests {
     use super::compute_library_cols;
+    use crate::config::LibraryGridSize;
 
     #[test]
-    fn library_cols_adapt_from_phone_to_tablet() {
-        assert_eq!(compute_library_cols(412.0, 0.0, 0.0), 2);
-        assert_eq!(compute_library_cols(680.0, 0.0, 0.0), 3);
-        assert_eq!(compute_library_cols(1024.0, 0.0, 0.0), 4);
+    fn library_cols_adapt_from_phone_to_tablet_and_grid_size() {
+        assert_eq!(
+            compute_library_cols(412.0, 0.0, 0.0, LibraryGridSize::Small),
+            3
+        );
+        assert_eq!(
+            compute_library_cols(412.0, 0.0, 0.0, LibraryGridSize::Medium),
+            2
+        );
+        assert_eq!(
+            compute_library_cols(412.0, 0.0, 0.0, LibraryGridSize::Large),
+            1
+        );
+
+        assert_eq!(
+            compute_library_cols(680.0, 0.0, 0.0, LibraryGridSize::Small),
+            4
+        );
+        assert_eq!(
+            compute_library_cols(680.0, 0.0, 0.0, LibraryGridSize::Medium),
+            3
+        );
+        assert_eq!(
+            compute_library_cols(680.0, 0.0, 0.0, LibraryGridSize::Large),
+            2
+        );
+
+        assert_eq!(
+            compute_library_cols(1024.0, 0.0, 0.0, LibraryGridSize::Small),
+            6
+        );
+        assert_eq!(
+            compute_library_cols(1024.0, 0.0, 0.0, LibraryGridSize::Medium),
+            4
+        );
+        assert_eq!(
+            compute_library_cols(1024.0, 0.0, 0.0, LibraryGridSize::Large),
+            3
+        );
     }
 }
