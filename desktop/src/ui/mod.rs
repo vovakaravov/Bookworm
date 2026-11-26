@@ -292,10 +292,21 @@ impl BookwormApp {
             book.title.clone()
         };
 
+        let cum_weights = book.chapter_cumulative_weights();
         let now = chrono::Utc::now().to_rfc3339();
         let user_state = {
             let entry = store.books.entry(rel_key.clone()).or_default();
             entry.total_chapters = book.chapters.len().max(1);
+            let ch = entry.chapter_idx.min(entry.total_chapters.saturating_sub(1));
+            let loc = EpubBook::global_location_from_weights(&cum_weights, ch, entry.scroll_pct);
+            entry.total_pages = loc.total_pages;
+            if entry.status == ReadingStatus::Finished {
+                entry.overall_pct = 1.0;
+                entry.current_page = loc.total_pages;
+            } else {
+                entry.overall_pct = loc.progress_frac;
+                entry.current_page = loc.page;
+            }
             if entry.status == ReadingStatus::Unread {
                 entry.status = ReadingStatus::Reading;
             }
@@ -327,14 +338,20 @@ impl BookwormApp {
                 chapter_idx,
                 total_chapters,
                 scroll_pct,
+                overall_pct,
+                current_page,
+                total_pages,
                 mark_finished,
             } => {
                 let mut store = LibraryStore::load(&app.workspace_root);
-                store.update_progress(
+                store.update_progress_global(
                     rel_path,
                     *chapter_idx,
                     *total_chapters,
                     *scroll_pct,
+                    *overall_pct,
+                    *current_page,
+                    *total_pages,
                     *mark_finished,
                 );
                 let _ = store.sync_save(&app.workspace_root);

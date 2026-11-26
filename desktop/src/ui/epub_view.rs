@@ -1,7 +1,7 @@
 use super::find_bar::{FIND_INPUT_W, find_count_badge, floating_find_card};
 use super::image_util::decode_bytes_image;
 use super::{BookTab, BookwormApp};
-use bookworm_core::epub::{EpubBlock, EpubBook, EpubRun, OutlineEntry};
+use bookworm_core::epub::{EpubBlock, EpubBook, EpubRun, GlobalBookLocation, OutlineEntry};
 use bookworm_core::find_all_byte_ranges;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookUserState, ChapterPage, HighlightColor, HighlightDecoration,
@@ -38,6 +38,9 @@ pub enum EpubViewEvent {
         chapter_idx: usize,
         total_chapters: usize,
         scroll_pct: f32,
+        overall_pct: f32,
+        current_page: usize,
+        total_pages: usize,
         mark_finished: bool,
     },
     PrefsChanged(ReaderPrefs),
@@ -86,6 +89,7 @@ pub struct EpubView {
     pub path: PathBuf,
     pub rel_path: String,
     pub book: EpubBook,
+    pub chapter_cum_weights: Vec<f32>,
     pub chapter_idx: usize,
     pub prefs: ReaderPrefs,
     pub is_finished: bool,
@@ -363,6 +367,7 @@ impl EpubView {
         });
 
         let ch_count = book.chapters.len();
+        let chapter_cum_weights = book.chapter_cumulative_weights();
         let initial_ch = user_state.chapter_idx.min(ch_count.saturating_sub(1));
         let restored_scroll = user_state.scroll_pct.clamp(0.0, 1.0);
         let pending_scroll_fraction = if restored_scroll > 0.01 {
@@ -375,6 +380,7 @@ impl EpubView {
             path,
             rel_path,
             book,
+            chapter_cum_weights,
             chapter_idx: initial_ch,
             prefs,
             is_finished: user_state.status == ReadingStatus::Finished,
@@ -433,6 +439,7 @@ impl EpubView {
     }
 
     pub fn reload_book(&mut self, book: EpubBook, cx: &mut Context<Self>) {
+        self.chapter_cum_weights = book.chapter_cumulative_weights();
         self.book = book;
         self.decoded_images.borrow_mut().clear();
         self.rendered_layouts.borrow_mut().clear();
@@ -464,7 +471,11 @@ impl EpubView {
         if self.prefs.pagination == ReaderPaginationPref::Page {
             let tp = self.chapter_pages.len().max(1);
             if tp <= 1 {
-                return 0.0;
+                return if self.chapter_idx + 1 >= self.book.chapters.len() {
+                    1.0
+                } else {
+                    0.0
+                };
             }
             return (self.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0);
         }
@@ -814,12 +825,19 @@ impl EpubView {
         self.prev_chapter(cx);
     }
 
+    pub fn global_location(&self) -> GlobalBookLocation {
+        EpubBook::global_location_from_weights(
+            &self.chapter_cum_weights,
+            self.chapter_idx,
+            self.current_scroll_pct(),
+        )
+    }
+
     pub fn overall_pct(&self) -> f32 {
         if self.is_finished {
             return 1.0;
         }
-        let total = self.book.chapters.len().max(1) as f32;
-        ((self.chapter_idx as f32 + self.current_scroll_pct()) / total).clamp(0.0, 1.0)
+        self.global_location().progress_frac
     }
 
     fn emit_progress(&mut self, mark_finished: bool, cx: &mut Context<Self>) {
@@ -828,11 +846,19 @@ impl EpubView {
         }
         let scroll_pct = self.current_scroll_pct();
         self.last_reported_scroll_pct = scroll_pct;
+        let loc = self.global_location();
         cx.emit(EpubViewEvent::ProgressChanged {
             rel_path: self.rel_path.clone(),
             chapter_idx: self.chapter_idx,
             total_chapters: self.book.chapters.len(),
             scroll_pct,
+            overall_pct: if mark_finished { 1.0 } else { loc.progress_frac },
+            current_page: if mark_finished {
+                loc.total_pages
+            } else {
+                loc.page
+            },
+            total_pages: loc.total_pages,
             mark_finished,
         });
     }
@@ -3301,24 +3327,23 @@ impl Render for EpubView {
                 .into_any_element()
         };
 
-        let overall_pct = self.overall_pct();
-        let pct_label = (overall_pct * 100.0).round() as u8;
-        let mins_left = self.estimated_minutes_left();
-        let page_prefix = if is_page_mode {
-            format!("Page {}/{} · ", page_idx + 1, total_pages)
+        let loc = self.global_location();
+        let overall_pct = if self.is_finished {
+            1.0
         } else {
-            String::new()
+            loc.progress_frac
         };
+        let pct_label = if self.is_finished { 100 } else { loc.progress_pct };
+        let mins_left = self.estimated_minutes_left();
         let footer_meta = if self.is_finished {
-            format!("{page_prefix}Ch {}/{} · 100% Finished", cur_ix + 1, ch_count.max(1))
+            format!("Page {} / {} · 100% Finished", loc.total_pages, loc.total_pages)
         } else if mins_left > 0 {
             format!(
-                "{page_prefix}Ch {}/{} · {pct_label}% · ~{mins_left} min left",
-                cur_ix + 1,
-                ch_count.max(1)
+                "Page {} / {} · {pct_label}% · ~{mins_left} min left",
+                loc.page, loc.total_pages
             )
         } else {
-            format!("{page_prefix}Ch {}/{} · {pct_label}%", cur_ix + 1, ch_count.max(1))
+            format!("Page {} / {} · {pct_label}%", loc.page, loc.total_pages)
         };
 
         let vp_slot = self.viewport_bounds.clone();

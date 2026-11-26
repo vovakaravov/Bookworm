@@ -109,6 +109,86 @@ pub struct EpubBook {
     pub total_words: usize,
 }
 
+/// Estimated rendered characters per standard trade paperback book page (~275–300 words).
+pub const CHARS_PER_BOOK_PAGE: f32 = 1750.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlobalBookLocation {
+    pub page: usize,
+    pub total_pages: usize,
+    pub progress_frac: f32,
+    pub progress_pct: u8,
+}
+
+pub fn chapter_book_weight(ch: &EpubChapter) -> f32 {
+    let mut w = 0.0_f32;
+    for blk in &ch.blocks {
+        w += match blk {
+            EpubBlock::Heading { text, .. } => text.chars().count() as f32 + 90.0,
+            EpubBlock::Paragraph { text, .. } => text.chars().count() as f32 + 35.0,
+            EpubBlock::ListItem { text, .. } => text.chars().count() as f32 + 25.0,
+            EpubBlock::Image { .. } => 450.0,
+            EpubBlock::Rule => 60.0,
+        };
+    }
+    w.max(150.0)
+}
+
+impl EpubBook {
+    pub fn chapter_cumulative_weights(&self) -> Vec<f32> {
+        let mut cum = Vec::with_capacity(self.chapters.len() + 1);
+        cum.push(0.0);
+        for ch in &self.chapters {
+            let next = cum.last().copied().unwrap_or(0.0) + chapter_book_weight(ch);
+            cum.push(next);
+        }
+        cum
+    }
+
+    pub fn global_location_from_weights(
+        cum: &[f32],
+        chapter_idx: usize,
+        chapter_frac: f32,
+    ) -> GlobalBookLocation {
+        if cum.len() <= 1 {
+            return GlobalBookLocation {
+                page: 1,
+                total_pages: 1,
+                progress_frac: 0.0,
+                progress_pct: 0,
+            };
+        }
+        let n = cum.len() - 1;
+        let ci = chapter_idx.min(n - 1);
+        let total_weight = cum[n].max(1.0);
+        let total_pages = (total_weight / CHARS_PER_BOOK_PAGE).round().max(1.0) as usize;
+        let ch_w = (cum[ci + 1] - cum[ci]).max(0.0);
+        let pos_w = (cum[ci] + ch_w * chapter_frac.clamp(0.0, 1.0)).clamp(0.0, total_weight);
+        let progress_frac = (pos_w / total_weight).clamp(0.0, 1.0);
+        let page = if total_pages <= 1 {
+            1
+        } else {
+            ((progress_frac * (total_pages - 1) as f32).round() as usize + 1).clamp(1, total_pages)
+        };
+        let progress_pct = (progress_frac * 100.0).round() as u8;
+        GlobalBookLocation {
+            page,
+            total_pages,
+            progress_frac,
+            progress_pct,
+        }
+    }
+
+    pub fn global_page_location(
+        &self,
+        chapter_idx: usize,
+        chapter_frac: f32,
+    ) -> GlobalBookLocation {
+        let cum = self.chapter_cumulative_weights();
+        Self::global_location_from_weights(&cum, chapter_idx, chapter_frac)
+    }
+}
+
 pub fn image_media_type_for_path(path: &Path) -> Option<&'static str> {
     let ext = path
         .extension()
@@ -1882,5 +1962,45 @@ mod tests {
         let mut zw = ZipArchive::new(file).unwrap();
         let opf = read_zip_text(&mut zw, "OEBPS/content.opf").unwrap();
         assert!(opf.contains("urn:uuid:1234-5678"));
+    }
+
+    #[test]
+    fn global_book_location_weights_real_chapters_and_handles_frontmatter() {
+        let para_len = 800usize;
+        let make_ch = |title: &str, paras: usize| EpubChapter {
+            title: title.into(),
+            blocks: (0..paras)
+                .map(|_| EpubBlock::Paragraph {
+                    text: "x".repeat(para_len),
+                    runs: Vec::new(),
+                    is_quote: false,
+                })
+                .collect(),
+        };
+        let book = EpubBook {
+            title: "Test Novel".into(),
+            author: None,
+            metadata: EpubMetadata::default(),
+            chapters: vec![
+                make_ch("Cover", 0),
+                make_ch("Copyright", 0),
+                make_ch("Dedication", 0),
+                make_ch("Chapter 1", 60),
+            ],
+            toc: Vec::new(),
+            total_words: 8000,
+        };
+        let fm = book.global_page_location(1, 0.5);
+        assert!(fm.total_pages >= 20 && fm.total_pages <= 40);
+        assert!(fm.progress_pct <= 5);
+        assert_eq!(fm.page, 1);
+
+        let mid = book.global_page_location(3, 0.5);
+        assert!(mid.progress_pct >= 45 && mid.progress_pct <= 55);
+        assert!(mid.page > 1 && mid.page < mid.total_pages);
+
+        let end = book.global_page_location(3, 1.0);
+        assert_eq!(end.page, end.total_pages);
+        assert_eq!(end.progress_pct, 100);
     }
 }

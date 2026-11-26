@@ -111,21 +111,18 @@ fn render_continue_reading_dock(
     let pct = book.progress_pct();
     let hl_count = book.user.highlights.len();
     let total_ch = book.user.total_chapters.max(book.chapter_count).max(1);
-    let subtitle = if hl_count > 0 {
+    let loc_str = if book.user.total_pages > 0 && book.user.current_page > 0 {
         format!(
-            "Continue · Ch {} / {} · {}% · ★{}",
-            book.user.chapter_idx + 1,
-            total_ch,
-            pct,
-            hl_count
+            "Page {} / {} · {}%",
+            book.user.current_page, book.user.total_pages, pct
         )
     } else {
-        format!(
-            "Continue · Ch {} / {} · {}%",
-            book.user.chapter_idx + 1,
-            total_ch,
-            pct
-        )
+        format!("Ch {} / {} · {}%", book.user.chapter_idx + 1, total_ch, pct)
+    };
+    let subtitle = if hl_count > 0 {
+        format!("Continue · {loc_str} · ★{hl_count}")
+    } else {
+        format!("Continue · {loc_str}")
     };
 
     let thumb = if let Some(cov) = &book.cover_cache_path {
@@ -366,11 +363,18 @@ fn render_book_card_in_row(
                         div()
                             .text_size(px(11.))
                             .text_color(hex_color(kd::FG_MUTED))
-                            .child(format!(
-                                "Ch {} / {} · {pct_str}",
-                                book.user.chapter_idx + 1,
-                                total_ch
-                            )),
+                            .child(if book.user.total_pages > 0 && book.user.current_page > 0 {
+                                format!(
+                                    "Page {} / {} · {pct_str}",
+                                    book.user.current_page, book.user.total_pages
+                                )
+                            } else {
+                                format!(
+                                    "Ch {} / {} · {pct_str}",
+                                    book.user.chapter_idx + 1,
+                                    total_ch
+                                )
+                            }),
                     )
                     .child(
                         h_flex()

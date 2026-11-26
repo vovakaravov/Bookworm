@@ -8,7 +8,7 @@ use crate::config::{
     default_books_root, has_external_storage_access, state_root_for,
 };
 use crate::theme::ReaderTheme;
-use bookworm_core::epub::{EpubBlock, EpubBook, create_sample_epub};
+use bookworm_core::epub::{EpubBlock, EpubBook, GlobalBookLocation, create_sample_epub};
 use bookworm_core::export_md::export_library_notes_to_dir;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookRecord, ChapterPage, HighlightColor, HighlightDecoration,
@@ -147,6 +147,7 @@ pub struct ReaderState {
     pub book_rel: String,
     pub book_title: String,
     pub book: EpubBook,
+    pub chapter_cum_weights: Vec<f32>,
     pub chapter_idx: usize,
     pub show_settings: bool,
     pub show_toc: bool,
@@ -193,6 +194,14 @@ pub struct ReaderState {
 }
 
 impl ReaderState {
+    pub fn global_location(&self, scroll_pct: f32) -> GlobalBookLocation {
+        EpubBook::global_location_from_weights(
+            &self.chapter_cum_weights,
+            self.chapter_idx,
+            scroll_pct,
+        )
+    }
+
     pub fn normalized_selection(&self) -> Option<(TextPos, TextPos)> {
         let a = self.selection_anchor?;
         let b = self.selection_head?;
@@ -1544,7 +1553,16 @@ impl BookwormMobileApp {
         {
             let tp = r.chapter_pages.len().max(1);
             if tp <= 1 {
-                return 0.0;
+                return if r.chapter_idx + 1 >= r.book.chapters.len() {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+            let two_col =
+                self.two_column_spread && f32::from(r.viewport_bounds.get().size.width) >= 700.0;
+            if two_col && r.current_page + 2 >= tp {
+                return 1.0;
             }
             return (r.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0);
         }
@@ -1880,11 +1898,15 @@ impl BookwormMobileApp {
             .get(&r.book_rel)
             .is_some_and(|u| u.status == ReadingStatus::Finished);
         let total = r.book.chapters.len().max(1);
-        self.library_store.update_progress(
+        let loc = r.global_location(clamped);
+        self.library_store.update_progress_global(
             &r.book_rel,
             r.chapter_idx,
             total,
             clamped,
+            loc.progress_frac,
+            loc.page,
+            loc.total_pages,
             already_finished,
         );
         r.last_saved_scroll_pct = clamped;
@@ -2125,11 +2147,17 @@ impl BookwormMobileApp {
                 let already_finished = user_state.status == ReadingStatus::Finished;
                 let book_title = rec.display_title().to_string();
                 let total = book.chapters.len().max(1);
-                app.library_store.update_progress(
+                let cum_weights = book.chapter_cumulative_weights();
+                let init_loc =
+                    EpubBook::global_location_from_weights(&cum_weights, start_ch, restored_scroll);
+                app.library_store.update_progress_global(
                     &rec.rel_path,
                     start_ch,
                     total,
                     restored_scroll,
+                    init_loc.progress_frac,
+                    init_loc.page,
+                    init_loc.total_pages,
                     already_finished,
                 );
                 if merged_conflicts > 0 {
@@ -2148,6 +2176,7 @@ impl BookwormMobileApp {
                     book_rel: rec.rel_path,
                     book_title,
                     book,
+                    chapter_cum_weights: cum_weights,
                     chapter_idx: start_ch,
                     show_settings: false,
                     show_toc: false,

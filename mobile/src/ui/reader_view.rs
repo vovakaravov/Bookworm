@@ -641,7 +641,6 @@ pub fn render_reader_view(
         .get(book_rel)
         .cloned()
         .unwrap_or_default();
-    let total_ch = book.chapters.len().max(1);
     let chapter = book.chapters.get(ch_idx);
     let ch_title = chapter
         .map(|c| c.title.clone())
@@ -2404,19 +2403,8 @@ pub fn render_reader_view(
         }
     };
 
-    let pct = (((ch_idx + 1) as f32 / total_ch as f32) * 100.0).round() as u8;
-    let footer_meta = if is_page_mode {
-        format!(
-            "Page {} / {} · Ch {} / {} · {}%",
-            page_idx + 1,
-            total_pages,
-            ch_idx + 1,
-            total_ch,
-            pct
-        )
-    } else {
-        format!("Ch {} / {} · {}%", ch_idx + 1, total_ch, pct)
-    };
+    let loc = r.global_location(app.reader_current_scroll_pct());
+    let footer_meta = format!("Page {} / {} · {}%", loc.page, loc.total_pages, loc.progress_pct);
     let kb_height = gpui_mobile::keyboard_height();
     let draft_sheet_bottom = (48.0 + app.safe_area.bottom).max(kb_height);
     let draft_bounds_tracker = draft_sheet_bounds_ref.clone();

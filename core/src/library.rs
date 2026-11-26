@@ -210,6 +210,10 @@ pub struct BookUserState {
     pub total_chapters: usize,
     pub scroll_pct: f32,
     pub overall_pct: f32,
+    #[serde(default)]
+    pub current_page: usize,
+    #[serde(default)]
+    pub total_pages: usize,
     pub last_opened: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -957,6 +961,7 @@ fn merge_book_user_state(a: &mut BookUserState, b: BookUserState) {
     merge_bookmarks_into(a, b.bookmarks, b.deleted_bookmarks);
 
     a.total_chapters = a.total_chapters.max(b.total_chapters);
+    a.total_pages = a.total_pages.max(b.total_pages);
     let a_open = a.last_opened.as_deref().unwrap_or("");
     let b_open = b.last_opened.as_deref().unwrap_or("");
     let take_b_progress = match ts_cmp(b_open, a_open) {
@@ -971,6 +976,10 @@ fn merge_book_user_state(a: &mut BookUserState, b: BookUserState) {
         a.chapter_idx = b.chapter_idx;
         a.scroll_pct = b.scroll_pct;
         a.overall_pct = b.overall_pct;
+        a.current_page = b.current_page;
+        if b.total_pages > 0 {
+            a.total_pages = b.total_pages;
+        }
         a.last_opened = b.last_opened;
     }
 
@@ -1119,6 +1128,44 @@ impl LibraryStore {
             1.0
         } else {
             ((chapter_idx as f32 + clamped_scroll) / entry.total_chapters as f32).clamp(0.0, 1.0)
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        entry.last_opened = Some(now.clone());
+        entry.updated_at = Some(now);
+        if mark_finished {
+            entry.status = ReadingStatus::Finished;
+        } else if entry.status == ReadingStatus::Unread {
+            entry.status = ReadingStatus::Reading;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_progress_global(
+        &mut self,
+        rel_key: &str,
+        chapter_idx: usize,
+        total_chapters: usize,
+        scroll_pct: f32,
+        overall_pct: f32,
+        current_page: usize,
+        total_pages: usize,
+        mark_finished: bool,
+    ) {
+        let clamped_scroll = scroll_pct.clamp(0.0, 1.0);
+        let entry = self.books.entry(rel_key.to_string()).or_default();
+        entry.chapter_idx = chapter_idx;
+        entry.total_chapters = total_chapters.max(1);
+        entry.scroll_pct = clamped_scroll;
+        entry.overall_pct = if mark_finished {
+            1.0
+        } else {
+            overall_pct.clamp(0.0, 1.0)
+        };
+        entry.total_pages = total_pages.max(1);
+        entry.current_page = if mark_finished {
+            entry.total_pages
+        } else {
+            current_page.clamp(1, entry.total_pages)
         };
         let now = chrono::Utc::now().to_rfc3339();
         entry.last_opened = Some(now.clone());

@@ -1388,7 +1388,12 @@ impl LibraryView {
             let title = rec.display_title().to_string();
             let author = rec.authors_display();
             let pct = rec.progress_pct();
-            let ch_info = if rec.user.total_chapters > 0 {
+            let ch_info = if rec.user.total_pages > 0 && rec.user.current_page > 0 {
+                format!(
+                    "Page {}/{} · {}% · Resume",
+                    rec.user.current_page, rec.user.total_pages, pct
+                )
+            } else if rec.user.total_chapters > 0 {
                 format!(
                     "Ch {}/{} · {}% · Resume",
                     rec.user.chapter_idx + 1,
