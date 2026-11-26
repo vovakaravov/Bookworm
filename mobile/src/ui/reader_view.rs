@@ -1,8 +1,11 @@
 use super::image_util::decode_bytes_image;
-use super::{BookwormMobileApp, ReaderState};
+use super::{BookwormMobileApp, ReaderState, SelectionHandleKind};
 use crate::theme::{ReaderPalette, ReaderTheme, hex_alpha, hex_color};
 use bookworm_core::epub::{EpubBlock, EpubRun};
-use bookworm_core::library::{BookHighlight, HighlightColor, HighlightDecoration, clamp_to_char_boundary};
+use bookworm_core::library::{
+    BookHighlight, HighlightColor, HighlightDecoration, ReaderPaginationPref, ReaderWidthPref,
+    clamp_to_char_boundary,
+};
 use gpui::{prelude::*, *};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Input;
@@ -19,15 +22,18 @@ fn highlight_fill_alpha(color: HighlightColor, light_paper: bool) -> Hsla {
     hex_alpha((color.rgb_hex() << 8) | alpha)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn flatten_block_highlights(
     text: &str,
     runs: &[EpubRun],
     block_hls: &[(&BookHighlight, Range<usize>)],
+    sel_range: Option<Range<usize>>,
     code_bg: Hsla,
     code_fg: Hsla,
+    sel_bg: Hsla,
     light_paper: bool,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    let mut pts = Vec::with_capacity((runs.len() + block_hls.len()) * 2);
+    let mut pts = Vec::with_capacity((runs.len() + block_hls.len() + 1) * 2);
     let mut push_range = |r: &Range<usize>| {
         let a = clamp_to_char_boundary(text, r.start);
         let b = clamp_to_char_boundary(text, r.end);
@@ -42,6 +48,9 @@ pub fn flatten_block_highlights(
     }
     for (_, r) in block_hls {
         push_range(r);
+    }
+    if let Some(sr) = &sel_range {
+        push_range(sr);
     }
 
     if pts.len() < 2 {
@@ -72,7 +81,13 @@ pub fn flatten_block_highlights(
             })
             .collect();
 
-        if base_run.is_none() && matching_hls.is_empty() {
+        let in_sel = sel_range.as_ref().is_some_and(|sr| {
+            let rs = clamp_to_char_boundary(text, sr.start);
+            let re = clamp_to_char_boundary(text, sr.end);
+            rs <= a && re >= b
+        });
+
+        if base_run.is_none() && matching_hls.is_empty() && !in_sel {
             continue;
         }
 
@@ -133,6 +148,10 @@ pub fn flatten_block_highlights(
             }
         }
 
+        if in_sel {
+            style.background_color = Some(sel_bg);
+        }
+
         out.push((a..b, style));
     }
 
@@ -167,14 +186,17 @@ pub fn split_blocks_two_columns(blocks: &[EpubBlock]) -> usize {
     split.clamp(1, blocks.len() - 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_paragraph_text(
     blk_idx: usize,
     text: String,
     runs: &[EpubRun],
     highlights: &[BookHighlight],
+    sel_range: Option<Range<usize>>,
     chapter_idx: usize,
     code_bg: Hsla,
     code_fg: Hsla,
+    sel_bg: Hsla,
     light_paper: bool,
     rendered_layouts: &Rc<RefCell<Vec<(usize, usize, TextLayout)>>>,
 ) -> AnyElement {
@@ -186,7 +208,16 @@ fn render_paragraph_text(
                 .map(|r| (hl, r))
         })
         .collect();
-    let flat = flatten_block_highlights(&text, runs, &block_hls, code_bg, code_fg, light_paper);
+    let flat = flatten_block_highlights(
+        &text,
+        runs,
+        &block_hls,
+        sel_range,
+        code_bg,
+        code_fg,
+        sel_bg,
+        light_paper,
+    );
     let st = if flat.is_empty() {
         StyledText::new(text)
     } else {
@@ -202,7 +233,7 @@ fn render_paragraph_text(
 fn render_chapter_block(
     b_ix: usize,
     blk: &EpubBlock,
-    selected: bool,
+    sel_range: Option<Range<usize>>,
     ch_idx: usize,
     font_size: f32,
     pal: ReaderPalette,
@@ -210,10 +241,14 @@ fn render_chapter_block(
     highlights: &[BookHighlight],
     rendered_layouts: &Rc<RefCell<Vec<(usize, usize, TextLayout)>>>,
     decoded_images: &RefCell<HashMap<(usize, usize), Arc<Image>>>,
-    cx: &mut Context<BookwormMobileApp>,
 ) -> AnyElement {
     let code_bg = hex_color(pal.surface);
     let code_fg = hex_color(pal.accent);
+    let sel_bg = if light_paper {
+        hex_alpha(0x3b82f64c)
+    } else {
+        hex_alpha(0x7e9cd858)
+    };
     match blk {
         EpubBlock::Heading { level, text } => {
             let size = match level {
@@ -226,9 +261,11 @@ fn render_chapter_block(
                 text.clone(),
                 &[],
                 highlights,
+                sel_range,
                 ch_idx,
                 code_bg,
                 code_fg,
+                sel_bg,
                 light_paper,
                 rendered_layouts,
             );
@@ -239,10 +276,6 @@ fn render_chapter_block(
                 .text_size(px(size))
                 .font_weight(FontWeight::BOLD)
                 .text_color(hex_color(pal.fg))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.reader_open_highlight_draft(b_ix, window, cx);
-                }))
                 .child(rendered)
                 .into_any_element()
         }
@@ -256,9 +289,11 @@ fn render_chapter_block(
                 text.clone(),
                 runs,
                 highlights,
+                sel_range,
                 ch_idx,
                 code_bg,
                 code_fg,
+                sel_bg,
                 light_paper,
                 rendered_layouts,
             );
@@ -268,22 +303,15 @@ fn render_chapter_block(
                 .px_1p5()
                 .py_1()
                 .rounded(px(6.))
-                .cursor_pointer()
                 .when(*is_quote, |el| {
                     el.pl_3()
                         .border_l_2()
                         .border_color(hex_color(pal.accent))
                         .bg(hex_color(pal.quote_bg))
                 })
-                .when(selected, |el| {
-                    el.border_1().border_color(hex_color(pal.accent))
-                })
                 .text_size(px(font_size))
                 .line_height(relative(1.62))
                 .text_color(hex_color(if *is_quote { pal.muted } else { pal.fg }))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.reader_open_highlight_draft(b_ix, window, cx);
-                }))
                 .child(rendered)
                 .into_any_element()
         }
@@ -293,9 +321,11 @@ fn render_chapter_block(
                 text.clone(),
                 runs,
                 highlights,
+                sel_range,
                 ch_idx,
                 code_bg,
                 code_fg,
+                sel_bg,
                 light_paper,
                 rendered_layouts,
             );
@@ -307,16 +337,9 @@ fn render_chapter_block(
                 .pl_2()
                 .py_0p5()
                 .rounded(px(6.))
-                .cursor_pointer()
-                .when(selected, |el| {
-                    el.border_1().border_color(hex_color(pal.accent))
-                })
                 .text_size(px(font_size))
                 .line_height(relative(1.58))
                 .text_color(hex_color(pal.fg))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.reader_open_highlight_draft(b_ix, window, cx);
-                }))
                 .child(div().text_color(hex_color(pal.accent)).child("•"))
                 .child(div().flex_1().min_w_0().child(rendered))
                 .into_any_element()
@@ -361,31 +384,84 @@ fn render_chapter_block(
 
 pub fn render_reader_view(
     app: &mut BookwormMobileApp,
-    window: &Window,
+    window: &mut Window,
     cx: &mut Context<BookwormMobileApp>,
 ) -> impl IntoElement {
     app.maybe_schedule_reader_scroll_save(cx);
+    let needs_page_sync = app.reader_pagination == ReaderPaginationPref::Page
+        && app
+            .reader
+            .as_ref()
+            .is_some_and(|r| !r.show_toc && !r.show_notes);
+    if needs_page_sync {
+        let changed = app.sync_reader_page_layout();
+        let still_pending = app.reader.as_ref().is_some_and(|r| r.needs_page_recompute);
+        if changed || still_pending {
+            let entity = cx.entity().clone();
+            window.on_next_frame(move |_, cx| {
+                let _ = entity.update(cx, |_, cx| cx.notify());
+            });
+        }
+    }
+
     let wide_viewport = f32::from(window.viewport_size().width) >= 700.0;
     let use_two_col = app.two_column_spread && wide_viewport;
+    let is_page_mode = app.reader_pagination == ReaderPaginationPref::Page;
+    let width_pref = app.reader_width;
+    let col_max_w = if use_two_col {
+        Some(1140.0)
+    } else {
+        width_pref.max_width_px_opt()
+    };
 
-    let Some(ReaderState {
-        book_rel,
-        book_title,
-        book,
-        chapter_idx,
-        show_settings,
-        show_toc,
-        show_notes,
-        notes_color_filter,
-        notes_only_filter,
-        draft,
-        rendered_layouts,
-        decoded_images,
-        ..
-    }) = &app.reader
-    else {
+    let Some(r) = &app.reader else {
         return div().size_full().into_any_element();
     };
+    let book_rel = &r.book_rel;
+    let book_title = &r.book_title;
+    let book = &r.book;
+    let ch_idx = r.chapter_idx.min(book.chapters.len().max(1).saturating_sub(1));
+    let show_settings = &r.show_settings;
+    let show_toc = &r.show_toc;
+    let show_notes = &r.show_notes;
+    let notes_color_filter = &r.notes_color_filter;
+    let notes_only_filter = &r.notes_only_filter;
+    let draft = &r.draft;
+    let rendered_layouts = &r.rendered_layouts;
+    let decoded_images = &r.decoded_images;
+    let vp_slot = r.viewport_bounds.clone();
+    let vp_bounds = r.viewport_bounds.get();
+    let visual_swipe_x = r.visual_swipe_offset_x();
+    let is_long_pressing = r.is_long_press_selecting;
+    let handle_points = if !*show_toc && !*show_notes && !is_long_pressing {
+        r.selection_handle_points(vp_bounds)
+    } else {
+        (None, None)
+    };
+    let (page_idx, total_pages, page_clip_h) = if is_page_mode {
+        let pages = r.page_offsets.borrow();
+        let tp = pages.len().max(1);
+        let cp = r.current_page.min(tp - 1);
+        let vp_h = f32::from(app.reader_scroll.bounds().size.height);
+        let clip_h = pages.get(cp).map(|p| p.1).unwrap_or(vp_h);
+        (cp, tp, clip_h)
+    } else {
+        (0, 1, 0.0)
+    };
+    let selection_bounds: Vec<Option<Range<usize>>> = book
+        .chapters
+        .get(ch_idx)
+        .map(|c| {
+            c.blocks
+                .iter()
+                .enumerate()
+                .map(|(ix, b)| {
+                    super::block_plain_text(b)
+                        .and_then(|t| r.block_selection_range(ix, t.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let pal = app.reader_theme.palette();
     let light_paper = matches!(app.reader_theme, ReaderTheme::Sepia | ReaderTheme::Paper);
@@ -396,7 +472,6 @@ pub fn render_reader_view(
         .cloned()
         .unwrap_or_default();
     let total_ch = book.chapters.len().max(1);
-    let ch_idx = (*chapter_idx).min(total_ch.saturating_sub(1));
     let chapter = book.chapters.get(ch_idx);
     let ch_title = chapter
         .map(|c| c.title.clone())
@@ -437,6 +512,19 @@ pub fn render_reader_view(
             h_flex()
                 .gap_1()
                 .flex_shrink_0()
+                .child(
+                    Button::new("rdr-page-toggle")
+                        .with_variant(if is_page_mode {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        })
+                        .small()
+                        .label(if is_page_mode { "Page" } else { "Scroll" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_reader_pagination(cx);
+                        })),
+                )
                 .when(wide_viewport, |row| {
                     row.child(
                         Button::new("rdr-two-col")
@@ -537,18 +625,67 @@ pub fn render_reader_view(
                         ),
                 )
                 .child(
-                    Button::new("rdr-bm-btn")
-                        .with_variant(if is_bookmarked {
-                            ButtonVariant::Primary
-                        } else {
-                            ButtonVariant::Secondary
-                        })
-                        .small()
-                        .label(if is_bookmarked { "🔖 Saved" } else { "🔖 Mark" })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.reader_toggle_bookmark(cx);
-                        })),
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            Button::new("rdr-mode-pill")
+                                .with_variant(if is_page_mode {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .small()
+                                .label(if is_page_mode { "Mode: Page" } else { "Mode: Scroll" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_reader_pagination(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("rdr-bm-btn")
+                                .with_variant(if is_bookmarked {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .small()
+                                .label(if is_bookmarked { "🔖 Saved" } else { "🔖 Mark" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reader_toggle_bookmark(cx);
+                                })),
+                        ),
                 ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_1p5()
+                .children(ReaderWidthPref::all_single_column().iter().copied().map(|rw| {
+                    let active = width_pref == rw && !app.two_column_spread;
+                    div()
+                        .id(SharedString::from(format!("rw-{}", rw.label())))
+                        .flex_1()
+                        .py_1()
+                        .rounded(px(7.))
+                        .cursor_pointer()
+                        .bg(hex_color(if active { pal.accent } else { pal.bg }))
+                        .border_1()
+                        .border_color(hex_color(if active { pal.accent } else { pal.border }))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hex_color(if active { 0x181619 } else { pal.fg }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.two_column_spread {
+                                this.two_column_spread = false;
+                                this.persist_mobile_config(cx);
+                            }
+                            this.set_reader_width(rw, cx);
+                        }))
+                        .child(rw.label())
+                })),
         )
         .child(
             h_flex()
@@ -770,7 +907,7 @@ pub fn render_reader_view(
                                             .bg(hex_color(pal.surface))
                                             .text_xs()
                                             .text_color(hex_color(pal.muted))
-                                            .child("Tap any paragraph while reading to highlight it in 5 Moon+ Reader colors and attach a margin note."),
+                                            .child("Hold and drag across text while reading to highlight passages in 5 Moon+ Reader colors and attach margin notes."),
                                     )
                                 },
                             )
@@ -935,17 +1072,17 @@ pub fn render_reader_view(
             .into_any_element()
     } else {
         rendered_layouts.borrow_mut().clear();
-        let body_el = if let Some(ch) = chapter {
+        let body_inner = if let Some(ch) = chapter {
             if use_two_col && ch.blocks.len() >= 2 {
                 let split_idx = split_blocks_two_columns(&ch.blocks);
                 let mut left_col = v_flex().flex_1().min_w_0().gap_3p5();
                 let mut right_col = v_flex().flex_1().min_w_0().gap_3p5();
                 for (b_ix, blk) in ch.blocks.iter().enumerate() {
-                    let selected = draft.as_ref().is_some_and(|d| d.block_idx == b_ix);
+                    let sel_r = selection_bounds.get(b_ix).cloned().flatten();
                     let el = render_chapter_block(
                         b_ix,
                         blk,
-                        selected,
+                        sel_r,
                         ch_idx,
                         app.reader_font_size,
                         pal,
@@ -953,7 +1090,6 @@ pub fn render_reader_view(
                         &user_state.highlights,
                         rendered_layouts,
                         decoded_images,
-                        cx,
                     );
                     if b_ix < split_idx {
                         left_col = left_col.child(el);
@@ -975,11 +1111,11 @@ pub fn render_reader_view(
             } else {
                 let mut col = v_flex().flex_none().w_full().px_5().py_4().gap_3p5();
                 for (b_ix, blk) in ch.blocks.iter().enumerate() {
-                    let selected = draft.as_ref().is_some_and(|d| d.block_idx == b_ix);
+                    let sel_r = selection_bounds.get(b_ix).cloned().flatten();
                     col = col.child(render_chapter_block(
                         b_ix,
                         blk,
-                        selected,
+                        sel_r,
                         ch_idx,
                         app.reader_font_size,
                         pal,
@@ -987,7 +1123,6 @@ pub fn render_reader_view(
                         &user_state.highlights,
                         rendered_layouts,
                         decoded_images,
-                        cx,
                     ));
                 }
                 col.into_any_element()
@@ -996,24 +1131,472 @@ pub fn render_reader_view(
             v_flex().flex_none().w_full().px_5().py_4().into_any_element()
         };
 
+        // Readable column constraint (Comfort ~700px centered by default, toggleable to Full).
+        let body_el = div()
+            .flex_none()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .when_some(col_max_w, |d, w| d.max_w(px(w)))
+                    .child(body_inner),
+            )
+            .into_any_element();
+
+        let scroll_vp_h = f32::from(app.reader_scroll.bounds().size.height);
+        let page_mask_h = if is_page_mode && scroll_vp_h > 40.0 && page_clip_h + 1.0 < scroll_vp_h
+        {
+            (scroll_vp_h - page_clip_h).max(0.0)
+        } else {
+            0.0
+        };
+
+        let app_weak_gesture = cx.entity().downgrade();
+        let vp_measure = vp_slot.clone();
+        let entity_for_cap = cx.entity().clone();
+        let gesture_canvas = canvas(
+            move |bounds, _, _| vp_measure.set(bounds),
+            move |bounds, _, window, _cx| {
+                // 1. Hold & Drag (LongPressEvent) for character/word-accurate passage selection
+                let weak_lp = app_weak_gesture.clone();
+                let cap_ent = entity_for_cap.clone();
+                window.on_mouse_event(move |ev: &LongPressEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let handled = weak_lp
+                        .update(cx, |app, cx| {
+                            let is_reading = app
+                                .reader
+                                .as_ref()
+                                .is_some_and(|r| !r.show_toc && !r.show_notes);
+                            if !is_reading {
+                                return false;
+                            }
+                            match ev.phase {
+                                TouchPhase::Started => {
+                                    if !bounds.contains(&ev.start_position) {
+                                        return false;
+                                    }
+                                    let Some(r) = &mut app.reader else {
+                                        return false;
+                                    };
+                                    if !r.select_word_at_point(ev.start_position, Some(bounds)) {
+                                        return false;
+                                    }
+                                    r.is_long_press_selecting = true;
+                                    r.swipe_active = false;
+                                    r.swipe_offset_x = 0.0;
+                                    window.capture_long_press(&cap_ent);
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                    true
+                                }
+                                TouchPhase::Moved => {
+                                    let Some(r) = &mut app.reader else {
+                                        return false;
+                                    };
+                                    if !r.is_long_press_selecting {
+                                        return false;
+                                    }
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    if let Some(hit) = r.hit_test_position(ev.position, Some(bounds))
+                                        && r.selection_head != Some(hit)
+                                    {
+                                        r.selection_head = Some(hit);
+                                        cx.notify();
+                                    }
+                                    true
+                                }
+                                TouchPhase::Ended | TouchPhase::Cancelled => {
+                                    let Some(r) = &mut app.reader else {
+                                        return false;
+                                    };
+                                    if !r.is_long_press_selecting {
+                                        return false;
+                                    }
+                                    r.is_long_press_selecting = false;
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    app.reader_finalize_selection_draft(window, cx);
+                                    true
+                                }
+                            }
+                        })
+                        .unwrap_or(false);
+                    let _ = handled;
+                });
+
+                // 2. Draggable Start/End selection handles (TouchDragEvent)
+                let weak_td = app_weak_gesture.clone();
+                window.on_mouse_event(move |ev: &TouchDragEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = weak_td.update(cx, |app, cx| {
+                        let last_c = app.library_store.reader_prefs.last_highlight_color;
+                        let last_s = app.library_store.reader_prefs.last_highlight_style;
+                        let Some(r) = &mut app.reader else {
+                            return;
+                        };
+                        if r.show_toc || r.show_notes {
+                            return;
+                        }
+                        match ev.phase {
+                            TouchPhase::Started => {
+                                let (s_pt, e_pt) = r.selection_handle_points(bounds);
+                                let hit_radius_sq = 32.0_f32 * 32.0;
+                                let near = |pt_opt: Option<Point<Pixels>>| -> Option<f32> {
+                                    let p = pt_opt?;
+                                    let dx = f32::from(ev.start_position.x - p.x);
+                                    let dy = f32::from(ev.start_position.y - p.y);
+                                    let d2 = dx * dx + dy * dy;
+                                    (d2 <= hit_radius_sq).then_some(d2)
+                                };
+                                let chosen = match (near(s_pt), near(e_pt)) {
+                                    (Some(a), Some(b)) => Some(if a <= b {
+                                        SelectionHandleKind::Start
+                                    } else {
+                                        SelectionHandleKind::End
+                                    }),
+                                    (Some(_), None) => Some(SelectionHandleKind::Start),
+                                    (None, Some(_)) => Some(SelectionHandleKind::End),
+                                    (None, None) => None,
+                                };
+                                if let Some(kind) = chosen {
+                                    r.dragging_handle = Some(kind);
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }
+                            TouchPhase::Moved => {
+                                if let Some(kind) = r.dragging_handle {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    if r.update_handle_drag_at(kind, ev.position, Some(bounds), last_c, last_s) {
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                            TouchPhase::Ended | TouchPhase::Cancelled => {
+                                if r.dragging_handle.take().is_some() {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    });
+                });
+            },
+        )
+        .size_full();
+
+        let (start_handle_pt, end_handle_pt) = handle_points;
+        let handle_overlay = |pt_opt: Option<Point<Pixels>>, is_start: bool| -> Option<AnyElement> {
+            let pt = pt_opt?;
+            let rel_x = (f32::from(pt.x - vp_bounds.origin.x) - 8.0)
+                .clamp(2.0, (f32::from(vp_bounds.size.width) - 18.0).max(2.0));
+            let rel_y = (f32::from(pt.y - vp_bounds.origin.y) + 2.0)
+                .clamp(2.0, (f32::from(vp_bounds.size.height) - 24.0).max(2.0));
+            Some(
+                div()
+                    .absolute()
+                    .left(px(rel_x))
+                    .top(px(rel_y))
+                    .w(px(16.))
+                    .h(px(22.))
+                    .rounded(px(8.))
+                    .bg(hex_color(pal.accent))
+                    .border_2()
+                    .border_color(hex_color(0xffffff))
+                    .when(is_start, |d| d.rounded_tr(px(2.)))
+                    .when(!is_start, |d| d.rounded_tl(px(2.)))
+                    .into_any_element(),
+            )
+        };
+
+        // Page-flip spine curl shadow overlay when swiping or animating
+        let flip_shadow_overlay = if visual_swipe_x.abs() > 2.0 && vp_bounds.size.width > px(40.) {
+            let vp_w = f32::from(vp_bounds.size.width);
+            let progress = (visual_swipe_x.abs() / vp_w).clamp(0.0, 1.0);
+            let edge_x = if visual_swipe_x < 0.0 {
+                (vp_w + visual_swipe_x).clamp(0.0, vp_w)
+            } else {
+                visual_swipe_x.clamp(0.0, vp_w)
+            };
+            let shadow_alpha = ((0.42 - progress * 0.18).max(0.10) * 255.0) as u32;
+            Some(
+                div()
+                    .id("rdr-flip-shadow")
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px((edge_x - 22.0).max(0.0)))
+                            .w(px(26.))
+                            .bg(hex_alpha(0x00000000 | shadow_alpha)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(edge_x))
+                            .w(px(2.))
+                            .bg(hex_color(pal.border)),
+                    ),
+            )
+        } else {
+            None
+        };
+
         div()
+            .id("rdr-viewport-shell")
             .relative()
             .flex_1()
             .min_h_0()
             .w_full()
+            .overflow_hidden()
             .child(
-                v_flex()
-                    .id("epub-chapter-scroll")
+                div()
+                    .relative()
                     .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&app.reader_scroll)
-                    .child(body_el),
+                    .left(px(visual_swipe_x))
+                    .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                        let is_page = this.reader_pagination == ReaderPaginationPref::Page;
+                        let delta = ev.delta.pixel_delta(px(24.));
+                        let dx = f32::from(delta.x);
+                        let dy = f32::from(delta.y);
+
+                        let blocked_by_sel = this.reader.as_ref().is_some_and(|r| {
+                            r.is_long_press_selecting
+                                || r.dragging_handle.is_some()
+                                || r.draft.is_some()
+                                || r.show_toc
+                                || r.show_notes
+                        });
+                        if blocked_by_sel {
+                            cx.stop_propagation();
+                            return;
+                        }
+
+                        if ev.touch_phase == TouchPhase::Started {
+                            if let Some(r) = &mut this.reader {
+                                r.swipe_ignore_momentum = false;
+                            }
+                        }
+
+                        let already_swiping =
+                            this.reader.as_ref().is_some_and(|r| r.swipe_active);
+                        let ignore_mom =
+                            this.reader.as_ref().is_some_and(|r| r.swipe_ignore_momentum);
+                        let is_horizontal = !ignore_mom
+                            && (already_swiping || (dx.abs() > 1.0 && dx.abs() > dy.abs() * 1.15));
+
+                        if is_horizontal {
+                            cx.stop_propagation();
+                            let mut commit: Option<i8> = None;
+                            let mut spring_from: Option<f32> = None;
+                            let vp_w = this
+                                .reader
+                                .as_ref()
+                                .map(|r| f32::from(r.viewport_bounds.get().size.width).max(300.0))
+                                .unwrap_or(360.0);
+
+                            if let Some(r) = &mut this.reader {
+                                match ev.touch_phase {
+                                    TouchPhase::Started | TouchPhase::Moved => {
+                                        r.swipe_active = true;
+                                        r.flip_anim = None;
+                                        let next_raw = r.swipe_offset_x + dx;
+                                        let can_prev = if is_page {
+                                            r.current_page > 0 || r.chapter_idx > 0
+                                        } else {
+                                            r.chapter_idx > 0
+                                        };
+                                        let can_next = if is_page {
+                                            let pc = r.page_offsets.borrow().len();
+                                            r.current_page + 1 < pc
+                                                || r.chapter_idx + 1 < r.book.chapters.len()
+                                        } else {
+                                            r.chapter_idx + 1 < r.book.chapters.len()
+                                        };
+                                        let eff_dx = if (next_raw > 0.0 && !can_prev)
+                                            || (next_raw < 0.0 && !can_next)
+                                        {
+                                            dx * 0.25
+                                        } else {
+                                            dx
+                                        };
+                                        r.swipe_offset_x =
+                                            (r.swipe_offset_x + eff_dx).clamp(-vp_w * 0.85, vp_w * 0.85);
+                                        cx.notify();
+                                    }
+                                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                                        let final_off = r.swipe_offset_x;
+                                        r.swipe_active = false;
+                                        r.swipe_ignore_momentum = true;
+                                        let threshold = (vp_w * 0.14).clamp(42.0, 90.0);
+                                        if final_off <= -threshold {
+                                            commit = Some(1);
+                                            spring_from = Some(vp_w * 0.45);
+                                        } else if final_off >= threshold {
+                                            commit = Some(-1);
+                                            spring_from = Some(-vp_w * 0.45);
+                                        } else if final_off.abs() > 1.0 {
+                                            spring_from = Some(final_off);
+                                        }
+                                        r.swipe_offset_x = 0.0;
+                                    }
+                                }
+                            }
+
+                            if let Some(dir) = commit {
+                                if dir > 0 {
+                                    this.reader_next_page_or_chapter(spring_from, window, cx);
+                                } else {
+                                    this.reader_prev_page_or_chapter(spring_from, window, cx);
+                                }
+                            } else if let Some(sx) = spring_from {
+                                this.reader_start_page_flip_anim(sx, 0.0, 0, cx);
+                            }
+                            return;
+                        }
+
+                        if is_page {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                            if let Some(r) = &mut this.reader {
+                                if r.show_toc || r.show_notes {
+                                    return;
+                                }
+                                r.mouse_down_pos = Some(ev.position);
+                                r.is_mouse_selecting = false;
+                                // Note: Do NOT create paragraph selection on mouse down!
+                                if ev.click_count == 2 {
+                                    let b = r.viewport_bounds.get();
+                                    if r.select_word_at_point(ev.position, Some(b)) {
+                                        r.is_mouse_selecting = true;
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                        let Some(r) = &mut this.reader else {
+                            return;
+                        };
+                        if !ev.dragging() || r.is_long_press_selecting || r.dragging_handle.is_some() {
+                            return;
+                        }
+                        if r.is_mouse_selecting {
+                            let b = r.viewport_bounds.get();
+                            if let Some(hit) = r.hit_test_position(ev.position, Some(b))
+                                && r.selection_head != Some(hit)
+                            {
+                                r.selection_head = Some(hit);
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseUpEvent, window, cx| {
+                            if let Some(r) = &mut this.reader {
+                                if r.show_toc || r.show_notes || r.is_long_press_selecting {
+                                    return;
+                                }
+                                if r.is_mouse_selecting {
+                                    r.is_mouse_selecting = false;
+                                    this.reader_finalize_selection_draft(window, cx);
+                                    return;
+                                }
+                                let down_pos = r.mouse_down_pos.take();
+                                let moved_far = down_pos.is_some_and(|p| {
+                                    let dx = f32::from(ev.position.x - p.x);
+                                    let dy = f32::from(ev.position.y - p.y);
+                                    dx * dx + dy * dy > 64.0
+                                });
+                                if moved_far {
+                                    return;
+                                }
+
+                                // Simple tap: ONLY act if tapping an already highlighted/annotated span!
+                                let b = r.viewport_bounds.get();
+                                let hit_pos = r.hit_test_position(ev.position, Some(b));
+                                let existing_hl = hit_pos.and_then(|pos| {
+                                    let user = this.library_store.books.get(&r.book_rel)?;
+                                    r.highlight_at_pos(&user.highlights, pos).cloned()
+                                });
+                                if let Some(hl) = existing_hl {
+                                    this.reader_open_existing_highlight(&hl, window, cx);
+                                    return;
+                                }
+
+                                if r.draft.is_some() || r.normalized_selection().is_some() {
+                                    r.clear_selection_and_draft();
+                                    window.blur(cx);
+                                    gpui_mobile::hide_keyboard();
+                                    cx.notify();
+                                }
+                            }
+                        }),
+                    )
+                    .child(
+                        v_flex()
+                            .id("epub-chapter-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&app.reader_scroll)
+                            .child(body_el),
+                    )
+                    .child(div().absolute().inset_0().child(gesture_canvas)),
             )
-            .child(Scrollbar::vertical(&app.reader_scroll))
+            .when_some(handle_overlay(start_handle_pt, true), |el, h| el.child(h))
+            .when_some(handle_overlay(end_handle_pt, false), |el, h| el.child(h))
+            .when_some(flip_shadow_overlay, |el, sh| el.child(sh))
+            .when(!is_page_mode, |el| el.child(Scrollbar::vertical(&app.reader_scroll)))
+            .when(is_page_mode && page_mask_h > 0.5, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(page_mask_h))
+                        .bg(hex_color(pal.bg)),
+                )
+            })
             .into_any_element()
     };
 
     let pct = (((ch_idx + 1) as f32 / total_ch as f32) * 100.0).round() as u8;
+    let footer_meta = if is_page_mode {
+        format!(
+            "Page {} / {} · Ch {} / {} · {}%",
+            page_idx + 1,
+            total_pages,
+            ch_idx + 1,
+            total_ch,
+            pct
+        )
+    } else {
+        format!("Ch {} / {} · {}%", ch_idx + 1, total_ch, pct)
+    };
     let footer = v_flex()
         .w_full()
         .flex_shrink_0()
@@ -1121,18 +1704,31 @@ pub fn render_reader_view(
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new("hl-cancel")
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if let Some(r) = &mut this.reader {
-                                            r.draft = None;
-                                        }
-                                        window.blur(cx);
-                                        gpui_mobile::hide_keyboard();
-                                        cx.notify();
-                                    })),
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Button::new("hl-cancel")
+                                            .ghost()
+                                            .small()
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if let Some(r) = &mut this.reader {
+                                                    r.clear_selection_and_draft();
+                                                }
+                                                window.blur(cx);
+                                                gpui_mobile::hide_keyboard();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("hl-copy")
+                                            .secondary()
+                                            .small()
+                                            .label("Copy")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.reader_copy_active_text(window, cx);
+                                            })),
+                                    ),
                             )
                             .child(
                                 h_flex()
@@ -1174,16 +1770,14 @@ pub fn render_reader_view(
                         .small()
                         .label("← Prev")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            if ch_idx > 0 {
-                                this.reader_go_chapter(ch_idx - 1, window, cx);
-                            }
+                            this.reader_prev_page_or_chapter(None, window, cx);
                         })),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(hex_color(pal.muted))
-                        .child(format!("Ch {} / {} · {}%", ch_idx + 1, total_ch, pct)),
+                        .child(footer_meta),
                 )
                 .child(
                     Button::new("rdr-next")
@@ -1191,9 +1785,7 @@ pub fn render_reader_view(
                         .small()
                         .label("Next →")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            if ch_idx + 1 < total_ch {
-                                this.reader_go_chapter(ch_idx + 1, window, cx);
-                            }
+                            this.reader_next_page_or_chapter(None, window, cx);
                         })),
                 ),
         )
@@ -1275,8 +1867,10 @@ mod tests {
             txt,
             &runs,
             &[(&hl, range)],
+            Some(0..5),
             hex_color(0x222222),
             hex_color(0xeeeeee),
+            hex_color(0x334466),
             false,
         );
         assert!(!flat.is_empty());

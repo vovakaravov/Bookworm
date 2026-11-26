@@ -5,8 +5,9 @@ use bookworm_core::epub::{EpubBlock, EpubBook, EpubRun, OutlineEntry};
 use bookworm_core::find_all_byte_ranges;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookUserState, HighlightColor, HighlightDecoration,
-    ReaderFontPref, ReaderPrefs, ReaderThemePref, ReaderWidthPref, ReadingStatus,
-    clamp_to_char_boundary, word_bounds_at,
+    ReaderFontPref, ReaderPaginationPref, ReaderPrefs, ReaderThemePref, ReaderWidthPref,
+    ReadingStatus, clamp_to_char_boundary, compute_chapter_page_offsets,
+    page_index_for_content_y, word_bounds_at,
 };
 use crate::theme::{hex_alpha, hex_color, kd};
 use std::collections::HashMap;
@@ -123,6 +124,11 @@ pub struct EpubView {
     scroll_jump_gen: u64,
     last_reported_scroll_pct: f32,
     scroll_save_scheduled: bool,
+    page_offsets: Rc<RefCell<Vec<(f32, f32)>>>,
+    current_page: usize,
+    pending_last_page: bool,
+    needs_page_recompute: bool,
+    last_wheel_page_at: Option<std::time::Instant>,
     decoded_images: RefCell<HashMap<(usize, usize), Arc<gpui_kit::Image>>>,
 }
 
@@ -406,6 +412,11 @@ impl EpubView {
             scroll_jump_gen: 0,
             last_reported_scroll_pct: restored_scroll,
             scroll_save_scheduled: false,
+            page_offsets: Rc::new(RefCell::new(vec![(0.0, 600.0)])),
+            current_page: 0,
+            pending_last_page: false,
+            needs_page_recompute: true,
+            last_wheel_page_at: None,
             decoded_images: RefCell::new(HashMap::new()),
         };
         if view.pending_scroll_fraction.is_some() {
@@ -419,6 +430,7 @@ impl EpubView {
         self.decoded_images.borrow_mut().clear();
         self.rendered_layouts.borrow_mut().clear();
         self.clear_selection_and_popup();
+        self.needs_page_recompute = true;
         let max_ch = self.book.chapters.len().saturating_sub(1);
         if self.chapter_idx > max_ch {
             self.chapter_idx = max_ch;
@@ -446,8 +458,128 @@ impl EpubView {
         if max_y <= 1.0 {
             return 0.0;
         }
-        let off_y = -f32::from(self.scroll_handle.offset().y);
+        let off_y = if self.prefs.pagination == ReaderPaginationPref::Page {
+            self.page_offsets
+                .borrow()
+                .get(self.current_page)
+                .map(|p| p.0)
+                .unwrap_or_else(|| -f32::from(self.scroll_handle.offset().y))
+        } else {
+            -f32::from(self.scroll_handle.offset().y)
+        };
         (off_y / max_y).clamp(0.0, 1.0)
+    }
+
+    fn collect_line_bands(&self, vp_top_y: f32, cur_off_y: f32) -> Vec<(f32, f32)> {
+        let layouts = self.rendered_layouts.borrow();
+        let mut bands = Vec::with_capacity(layouts.len() * 3);
+        for (_, _, layout) in layouts.iter() {
+            let b = layout.bounds();
+            let lh = f32::from(layout.line_height()).max(14.0);
+            let top = (f32::from(b.top()) - vp_top_y - cur_off_y).max(0.0);
+            let bot = (f32::from(b.bottom()) - vp_top_y - cur_off_y).max(top);
+            let mut y = top;
+            while y + 0.5 < bot {
+                let next = (y + lh).min(bot);
+                bands.push((y, next));
+                y = next;
+            }
+        }
+        bands
+    }
+
+    /// Recomputes discrete line-snapped page slices from the previously painted frame and
+    /// returns `true` if `current_page` / `page_offsets` changed and needs a follow-up paint.
+    fn sync_page_layout(&mut self) -> bool {
+        if self.prefs.pagination != ReaderPaginationPref::Page {
+            return false;
+        }
+        let scroll_bounds = self.scroll_handle.bounds();
+        let vp_h = f32::from(scroll_bounds.size.height);
+        if vp_h <= 20.0 {
+            return false;
+        }
+        let has_text = self
+            .book
+            .chapters
+            .get(self.chapter_idx)
+            .is_some_and(|c| c.blocks.iter().any(|b| block_plain_text(b).is_some()));
+        if has_text && self.rendered_layouts.borrow().is_empty() {
+            return false;
+        }
+
+        let vp_top_y = f32::from(scroll_bounds.top());
+        let cur_off_y = f32::from(self.scroll_handle.offset().y);
+        let max_y = f32::from(self.scroll_handle.max_offset().y).max(0.0);
+        let total_content_h = vp_h + max_y;
+        let bands = self.collect_line_bands(vp_top_y, cur_off_y);
+        let new_pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+
+        let mut changed = *self.page_offsets.borrow() != new_pages;
+        *self.page_offsets.borrow_mut() = new_pages;
+
+        let page_count = self.page_offsets.borrow().len().max(1);
+        if self.pending_last_page {
+            self.pending_last_page = false;
+            self.current_page = page_count - 1;
+            changed = true;
+        } else if self.current_page >= page_count {
+            self.current_page = page_count - 1;
+            changed = true;
+        }
+
+        if let Some((start_y, _)) = self.page_offsets.borrow().get(self.current_page).copied() {
+            let clamped_y = start_y.clamp(0.0, max_y);
+            let actual_y = -f32::from(self.scroll_handle.offset().y);
+            if (actual_y - clamped_y).abs() > 0.5 {
+                self.scroll_handle.set_offset(point(px(0.), px(-clamped_y)));
+                changed = true;
+            }
+        }
+        self.needs_page_recompute = false;
+        changed
+    }
+
+    pub fn go_to_page(&mut self, page_idx: usize, cx: &mut Context<Self>) {
+        self.sync_page_layout();
+        let count = self.page_offsets.borrow().len().max(1);
+        let clamped = page_idx.min(count - 1);
+        self.current_page = clamped;
+        let max_y = f32::from(self.scroll_handle.max_offset().y).max(0.0);
+        if let Some((start_y, _)) = self.page_offsets.borrow().get(clamped).copied() {
+            self.scroll_handle
+                .set_offset(point(px(0.), px(-start_y.clamp(0.0, max_y))));
+        }
+        self.emit_progress(false, cx);
+        cx.notify();
+    }
+
+    pub fn next_page_or_chapter(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.pagination == ReaderPaginationPref::Page {
+            self.sync_page_layout();
+            let count = self.page_offsets.borrow().len();
+            if self.current_page + 1 < count {
+                self.go_to_page(self.current_page + 1, cx);
+                return;
+            }
+        }
+        self.next_chapter(cx);
+    }
+
+    pub fn prev_page_or_chapter(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.pagination == ReaderPaginationPref::Page {
+            self.sync_page_layout();
+            if self.current_page > 0 {
+                self.go_to_page(self.current_page - 1, cx);
+                return;
+            }
+            if self.chapter_idx > 0 {
+                self.pending_last_page = true;
+                self.go_to_chapter(self.chapter_idx - 1, cx);
+                return;
+            }
+        }
+        self.prev_chapter(cx);
     }
 
     pub fn overall_pct(&self) -> f32 {
@@ -827,6 +959,7 @@ impl EpubView {
 
     pub fn set_font_size(&mut self, next: f32, cx: &mut Context<Self>) {
         self.prefs.font_size = next.clamp(11.0, 28.0);
+        self.needs_page_recompute = true;
         self.emit_prefs(cx);
         cx.notify();
     }
@@ -839,6 +972,7 @@ impl EpubView {
 
     pub fn toggle_font(&mut self, cx: &mut Context<Self>) {
         self.prefs.font = self.prefs.font.toggle();
+        self.needs_page_recompute = true;
         self.emit_prefs(cx);
         cx.notify();
     }
@@ -846,12 +980,28 @@ impl EpubView {
     pub fn cycle_width(&mut self, cx: &mut Context<Self>) {
         self.rendered_layouts.borrow_mut().clear();
         self.prefs.width = self.prefs.width.next();
+        self.needs_page_recompute = true;
+        self.emit_prefs(cx);
+        cx.notify();
+    }
+
+    pub fn toggle_pagination(&mut self, cx: &mut Context<Self>) {
+        let frac = self.current_scroll_pct();
+        self.prefs.pagination = self.prefs.pagination.toggle();
+        self.needs_page_recompute = true;
+        if self.prefs.pagination == ReaderPaginationPref::Page {
+            self.pending_scroll_fraction = Some(frac);
+            self.schedule_pending_scroll(cx);
+        } else {
+            self.pending_last_page = false;
+        }
         self.emit_prefs(cx);
         cx.notify();
     }
 
     pub fn cycle_spacing(&mut self, cx: &mut Context<Self>) {
         self.prefs.spacing = self.prefs.spacing.next();
+        self.needs_page_recompute = true;
         self.emit_prefs(cx);
         cx.notify();
     }
@@ -1110,7 +1260,19 @@ impl EpubView {
                 drop(layouts);
                 self.pending_scroll_block = None;
                 self.pending_scroll_fraction = None;
-                if max_y > 0.0 {
+                if self.prefs.pagination == ReaderPaginationPref::Page {
+                    let vp_h = f32::from(scroll_bounds.size.height);
+                    let total_content_h = vp_h + max_y.max(0.0);
+                    let bands = self.collect_line_bands(vp_top_y, cur_off_y);
+                    let pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+                    let p_ix = page_index_for_content_y(&pages, target_y);
+                    self.current_page = p_ix;
+                    let snapped = pages.get(p_ix).map(|p| p.0).unwrap_or(0.0).clamp(0.0, max_y.max(0.0));
+                    *self.page_offsets.borrow_mut() = pages;
+                    if max_y > 0.0 {
+                        self.scroll_handle.set_offset(point(px(0.), px(-snapped)));
+                    }
+                } else if max_y > 0.0 {
                     self.scroll_handle.set_offset(point(px(0.), px(-target_y)));
                 }
                 return true;
@@ -1119,11 +1281,29 @@ impl EpubView {
             self.pending_scroll_block = None;
         }
 
-        if let Some(frac) = self.pending_scroll_fraction.take()
-            && max_y > 0.0
-        {
-            let target_y = (frac.clamp(0.0, 1.0) * max_y).clamp(0.0, max_y);
-            self.scroll_handle.set_offset(point(px(0.), px(-target_y)));
+        if let Some(frac) = self.pending_scroll_fraction.take() {
+            let target_y = if max_y > 0.0 {
+                (frac.clamp(0.0, 1.0) * max_y).clamp(0.0, max_y)
+            } else {
+                0.0
+            };
+            if self.prefs.pagination == ReaderPaginationPref::Page {
+                let vp_h = f32::from(scroll_bounds.size.height);
+                let total_content_h = vp_h + max_y.max(0.0);
+                let vp_top_y = f32::from(scroll_bounds.top());
+                let cur_off_y = f32::from(self.scroll_handle.offset().y);
+                let bands = self.collect_line_bands(vp_top_y, cur_off_y);
+                let pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+                let p_ix = page_index_for_content_y(&pages, target_y);
+                self.current_page = p_ix;
+                let snapped = pages.get(p_ix).map(|p| p.0).unwrap_or(0.0).clamp(0.0, max_y.max(0.0));
+                *self.page_offsets.borrow_mut() = pages;
+                if max_y > 0.0 {
+                    self.scroll_handle.set_offset(point(px(0.), px(-snapped)));
+                }
+            } else if max_y > 0.0 {
+                self.scroll_handle.set_offset(point(px(0.), px(-target_y)));
+            }
         }
         true
     }
@@ -1562,7 +1742,7 @@ impl EpubView {
                         .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll(|_, _, cx| cx.stop_propagation())
                         .occlude()
-                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                             if ev.keystroke.key.as_str() == "escape" {
                                 cx.stop_propagation();
                                 this.clear_selection_and_popup();
@@ -1739,7 +1919,7 @@ impl EpubView {
                         .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll(|_, _, cx| cx.stop_propagation())
                         .occlude()
-                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                             if ev.keystroke.key.as_str() == "escape" {
                                 cx.stop_propagation();
                                 this.clear_selection_and_popup();
@@ -2314,6 +2494,9 @@ impl EpubView {
         self.rendered_layouts.borrow_mut().clear();
         self.clear_selection_and_popup();
         self.chapter_idx = idx.min(self.book.chapters.len() - 1);
+        self.current_page = 0;
+        self.needs_page_recompute = true;
+        *self.page_offsets.borrow_mut() = vec![(0.0, 600.0)];
         self.pending_scroll_block = None;
         self.pending_scroll_fraction = None;
         self.scroll_jump_gen = self.scroll_jump_gen.wrapping_add(1);
@@ -2382,6 +2565,14 @@ impl EpubView {
 
 impl Render for EpubView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.prefs.pagination == ReaderPaginationPref::Page
+            && (self.sync_page_layout() || self.needs_page_recompute)
+        {
+            let entity = cx.entity().clone();
+            window.on_next_frame(move |_, cx| {
+                let _ = entity.update(cx, |_, cx| cx.notify());
+            });
+        }
         let cur_scroll = self.current_scroll_pct();
         if !self.scroll_save_scheduled
             && self.pending_scroll_block.is_none()
@@ -2683,8 +2874,37 @@ impl Render for EpubView {
                 .into_any_element()
         };
 
+        let is_page_mode = self.prefs.pagination == ReaderPaginationPref::Page;
+        let (page_idx, total_pages, page_mask_h) = if is_page_mode {
+            let pages = self.page_offsets.borrow();
+            let total_p = pages.len().max(1);
+            let cur_p = self.current_page.min(total_p - 1);
+            let vp_h = f32::from(self.scroll_handle.bounds().size.height);
+            let clip_h = pages.get(cur_p).map(|p| p.1).unwrap_or(vp_h);
+            let mask_h = if vp_h > 40.0 && clip_h + 1.0 < vp_h {
+                (vp_h - clip_h).max(0.0)
+            } else {
+                0.0
+            };
+            (cur_p, total_p, mask_h)
+        } else {
+            (0, 1, 0.0)
+        };
+
         let is_last_chapter = cur_ix + 1 >= ch_count;
-        let footer_right = if is_last_chapter {
+        let at_book_end = is_last_chapter && (!is_page_mode || page_idx + 1 >= total_pages);
+        let at_book_start = cur_ix == 0 && (!is_page_mode || page_idx == 0);
+        let prev_label = if is_page_mode {
+            "Previous Page"
+        } else {
+            "Previous Chapter"
+        };
+        let next_label = if is_page_mode && page_idx + 1 < total_pages {
+            "Next Page"
+        } else {
+            "Next Chapter"
+        };
+        let footer_right = if at_book_end {
             Button::new("epub-foot-finish")
                 .with_variant(if self.is_finished {
                     ButtonVariant::Secondary
@@ -2707,9 +2927,9 @@ impl Render for EpubView {
                 .ghost()
                 .small()
                 .icon(IconName::ChevronRight)
-                .label("Next Chapter")
+                .label(next_label)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.next_chapter(cx);
+                    this.next_page_or_chapter(cx);
                 }))
                 .into_any_element()
         };
@@ -2717,16 +2937,21 @@ impl Render for EpubView {
         let overall_pct = self.overall_pct();
         let pct_label = (overall_pct * 100.0).round() as u8;
         let mins_left = self.estimated_minutes_left();
+        let page_prefix = if is_page_mode {
+            format!("Page {}/{} · ", page_idx + 1, total_pages)
+        } else {
+            String::new()
+        };
         let footer_meta = if self.is_finished {
-            format!("Ch {}/{} · 100% Finished", cur_ix + 1, ch_count.max(1))
+            format!("{page_prefix}Ch {}/{} · 100% Finished", cur_ix + 1, ch_count.max(1))
         } else if mins_left > 0 {
             format!(
-                "Ch {}/{} · {pct_label}% · ~{mins_left} min left",
+                "{page_prefix}Ch {}/{} · {pct_label}% · ~{mins_left} min left",
                 cur_ix + 1,
                 ch_count.max(1)
             )
         } else {
-            format!("Ch {}/{} · {pct_label}%", cur_ix + 1, ch_count.max(1))
+            format!("{page_prefix}Ch {}/{} · {pct_label}%", cur_ix + 1, ch_count.max(1))
         };
 
         let vp_slot = self.viewport_bounds.clone();
@@ -2737,7 +2962,7 @@ impl Render for EpubView {
             .size_full()
             .bg(outer_bg)
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
                     "escape" if this.find_open || this.bookmarks_open || this.popup.is_some() => {
                         cx.stop_propagation();
@@ -2760,17 +2985,30 @@ impl Render for EpubView {
                             }
                         }
                     }
-                    "left"
+                    "left" | "pageup"
                         if this.popup.is_none() && !this.find_open && !this.bookmarks_open =>
                     {
                         cx.stop_propagation();
-                        this.prev_chapter(cx);
+                        this.prev_page_or_chapter(cx);
                     }
-                    "right"
+                    "right" | "pagedown"
                         if this.popup.is_none() && !this.find_open && !this.bookmarks_open =>
                     {
                         cx.stop_propagation();
-                        this.next_chapter(cx);
+                        this.next_page_or_chapter(cx);
+                    }
+                    "space"
+                        if is_page_mode
+                            && this.popup.is_none()
+                            && !this.find_open
+                            && !this.bookmarks_open =>
+                    {
+                        cx.stop_propagation();
+                        if ev.keystroke.modifiers.shift {
+                            this.prev_page_or_chapter(cx);
+                        } else {
+                            this.next_page_or_chapter(cx);
+                        }
                     }
                     _ => {}
                 }
@@ -2805,6 +3043,26 @@ impl Render for EpubView {
                                     .flex_col()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.scroll_handle)
+                                    .when(is_page_mode, |el| {
+                                        el.on_scroll(cx.listener(|this, ev: &gpui_kit::ScrollEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            let dy = f32::from(ev.delta.pixel_delta(px(24.)).y);
+                                            if dy.abs() < 6.0 {
+                                                return;
+                                            }
+                                            let ready = this.last_wheel_page_at.is_none_or(|t| {
+                                                t.elapsed() >= std::time::Duration::from_millis(240)
+                                            });
+                                            if ready {
+                                                this.last_wheel_page_at = Some(std::time::Instant::now());
+                                                if dy < 0.0 {
+                                                    this.next_page_or_chapter(cx);
+                                                } else {
+                                                    this.prev_page_or_chapter(cx);
+                                                }
+                                            }
+                                        }))
+                                    })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -2976,7 +3234,9 @@ impl Render for EpubView {
                                     .child(
                                         v_flex()
                                             .w_full()
-                                            .max_w(px(self.prefs.width.max_width_px()))
+                                            .when_some(self.prefs.width.max_width_px_opt(), |d, w| {
+                                                d.max_w(px(w))
+                                            })
                                     .font_family(reader_font)
                                     .p_8()
                                     .gap_4()
@@ -3019,10 +3279,10 @@ impl Render for EpubView {
                                                     .ghost()
                                                     .small()
                                                     .icon(IconName::ChevronLeft)
-                                                    .label("Previous Chapter")
-                                                    .disabled(cur_ix == 0)
+                                                    .label(prev_label)
+                                                    .disabled(at_book_start)
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.prev_chapter(cx);
+                                                        this.prev_page_or_chapter(cx);
                                                     })),
                                             )
                                             .child(footer_right),
@@ -3030,7 +3290,18 @@ impl Render for EpubView {
                             ),
                                     ),
                             )
-                            .vertical_scrollbar(&self.scroll_handle)
+                            .when(!is_page_mode, |el| el.vertical_scrollbar(&self.scroll_handle))
+                            .when(is_page_mode && page_mask_h > 0.5, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(page_mask_h))
+                                        .bg(outer_bg),
+                                )
+                            })
                     )
                     .when_some(find_bar, |root, bar| root.child(bar))
                     .when_some(annotations_popover, |root, pop| root.child(pop))
@@ -3094,6 +3365,8 @@ pub fn render_epub_tab(
     let theme_label = ev.prefs.theme.label();
     let font_label = ev.prefs.font.label();
     let width_label = ev.prefs.width.label();
+    let page_mode = ev.prefs.pagination == ReaderPaginationPref::Page;
+    let page_mode_label = ev.prefs.pagination.label();
     let spacing_label = ev.prefs.spacing.label();
     let ann_count = ev.highlights.len() + ev.bookmarks.len();
     let bm_open = ev.bookmarks_open;
@@ -3108,6 +3381,7 @@ pub fn render_epub_tab(
     let v_lg = view.clone();
     let v_font = view.clone();
     let v_width = view.clone();
+    let v_page = view.clone();
     let v_spacing = view.clone();
     let v_thm = view.clone();
     let v_bm = view.clone();
@@ -3226,6 +3500,21 @@ pub fn render_epub_tab(
                         .tooltip("Cycle Page Width / 2-Column Spread")
                         .on_click(cx.listener(move |_, _, _, cx| {
                             v_width.update(cx, |v, cx| v.cycle_width(cx));
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("epub-page-mode-{tab_id}")))
+                        .with_variant(if page_mode {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::FileText)
+                        .label(page_mode_label)
+                        .tooltip("Toggle Paginated Page View vs Continuous Scroll")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            v_page.update(cx, |v, cx| v.toggle_pagination(cx));
                         })),
                 )
                 .child(

@@ -12,15 +12,18 @@ use bookworm_core::epub::{EpubBlock, EpubBook, create_sample_epub};
 use bookworm_core::export_md::export_library_notes_to_dir;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookRecord, HighlightColor, HighlightDecoration, LibraryStore,
-    ReaderThemePref, ReadingStatus, scan_books_cached,
+    ReaderPaginationPref, ReaderThemePref, ReaderWidthPref, ReadingStatus,
+    clamp_to_char_boundary, compute_chapter_page_offsets, page_index_for_content_y,
+    scan_books_cached, word_bounds_at,
 };
 use bookworm_core::{can_read_dir, count_direct_matching_files, list_subdirectories};
 use gpui::{prelude::*, *};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{Icon, IconName, h_flex};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,9 +93,42 @@ fn expand_picker_path(raw: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPos {
+    pub block_idx: usize,
+    pub byte_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionHandleKind {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PageFlipAnimation {
+    pub dir: i8,
+    pub started_at: Instant,
+    pub duration_ms: u64,
+    pub start_x: f32,
+    pub target_x: f32,
+}
+
+pub fn block_plain_text(blk: &EpubBlock) -> Option<&str> {
+    match blk {
+        EpubBlock::Heading { text, .. }
+        | EpubBlock::Paragraph { text, .. }
+        | EpubBlock::ListItem { text, .. } => Some(text.as_str()),
+        EpubBlock::Image { .. } | EpubBlock::Rule => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HighlightEditorDraft {
-    pub block_idx: usize,
+    pub start_block: usize,
+    pub start_offset: usize,
+    pub end_block: usize,
+    pub end_offset: usize,
     pub quote: String,
     pub existing_id: Option<String>,
     pub color: HighlightColor,
@@ -110,6 +146,22 @@ pub struct ReaderState {
     pub notes_color_filter: Option<HighlightColor>,
     pub notes_only_filter: bool,
     pub draft: Option<HighlightEditorDraft>,
+    pub viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub page_offsets: Rc<RefCell<Vec<(f32, f32)>>>,
+    pub current_page: usize,
+    pub pending_last_page: bool,
+    pub needs_page_recompute: bool,
+    pub selection_anchor: Option<TextPos>,
+    pub selection_head: Option<TextPos>,
+    pub is_long_press_selecting: bool,
+    pub dragging_handle: Option<SelectionHandleKind>,
+    pub mouse_down_pos: Option<Point<Pixels>>,
+    pub is_mouse_selecting: bool,
+    pub swipe_offset_x: f32,
+    pub swipe_active: bool,
+    pub swipe_ignore_momentum: bool,
+    pub flip_anim: Option<PageFlipAnimation>,
+    pub flip_anim_gen: u64,
     pub rendered_layouts: Rc<RefCell<Vec<(usize, usize, TextLayout)>>>,
     pub decoded_images: RefCell<HashMap<(usize, usize), Arc<Image>>>,
     pub pending_scroll_block: Option<(usize, usize)>,
@@ -117,6 +169,319 @@ pub struct ReaderState {
     pub scroll_jump_gen: u64,
     pub last_saved_scroll_pct: f32,
     pub scroll_save_scheduled: bool,
+}
+
+impl ReaderState {
+    pub fn normalized_selection(&self) -> Option<(TextPos, TextPos)> {
+        let a = self.selection_anchor?;
+        let b = self.selection_head?;
+        if a == b {
+            return None;
+        }
+        if a <= b { Some((a, b)) } else { Some((b, a)) }
+    }
+
+    pub fn block_selection_range(&self, blk_ix: usize, block_len: usize) -> Option<Range<usize>> {
+        let (start, end) = self.normalized_selection()?;
+        if blk_ix < start.block_idx || blk_ix > end.block_idx {
+            return None;
+        }
+        let a = if blk_ix == start.block_idx {
+            start.byte_offset.min(block_len)
+        } else {
+            0
+        };
+        let b = if blk_ix == end.block_idx {
+            end.byte_offset.min(block_len)
+        } else {
+            block_len
+        };
+        (a < b).then_some(a..b)
+    }
+
+    pub fn clear_selection_and_draft(&mut self) {
+        self.selection_anchor = None;
+        self.selection_head = None;
+        self.is_long_press_selecting = false;
+        self.dragging_handle = None;
+        self.mouse_down_pos = None;
+        self.is_mouse_selecting = false;
+        self.draft = None;
+    }
+
+    pub fn plain_text(&self, blk_ix: usize) -> Option<&str> {
+        self.book
+            .chapters
+            .get(self.chapter_idx)
+            .and_then(|c| c.blocks.get(blk_ix))
+            .and_then(block_plain_text)
+    }
+
+    pub fn extract_text_for_range(&self, start: TextPos, end: TextPos) -> String {
+        let Some(ch) = self.book.chapters.get(self.chapter_idx) else {
+            return String::new();
+        };
+        let mut parts = Vec::new();
+        for blk_ix in start.block_idx..=end.block_idx.min(ch.blocks.len().saturating_sub(1)) {
+            let Some(txt) = ch.blocks.get(blk_ix).and_then(block_plain_text) else {
+                continue;
+            };
+            let len = txt.len();
+            let a = if blk_ix == start.block_idx {
+                clamp_to_char_boundary(txt, start.byte_offset)
+            } else {
+                0
+            };
+            let b = if blk_ix == end.block_idx {
+                clamp_to_char_boundary(txt, end.byte_offset)
+            } else {
+                len
+            };
+            if a < b {
+                let slice = txt[a..b].trim();
+                if !slice.is_empty() {
+                    parts.push(slice);
+                }
+            }
+        }
+        parts.join("\n\n")
+    }
+
+    pub fn hit_test_position(
+        &self,
+        pos: Point<Pixels>,
+        clip_bounds: Option<Bounds<Pixels>>,
+    ) -> Option<TextPos> {
+        let layouts = self.rendered_layouts.borrow();
+        if layouts.is_empty() {
+            return None;
+        }
+        let in_clip = |b: Bounds<Pixels>| {
+            clip_bounds.is_none_or(|c| {
+                b.bottom() >= c.top() - px(12.) && b.top() <= c.bottom() + px(12.)
+            })
+        };
+
+        let mut chosen: Option<&(usize, usize, TextLayout)> = None;
+        for entry in layouts.iter() {
+            let b = entry.2.bounds();
+            if !in_clip(b) {
+                continue;
+            }
+            if b.top() - px(8.) <= pos.y
+                && pos.y <= b.bottom() + px(8.)
+                && b.left() - px(18.) <= pos.x
+                && pos.x <= b.right() + px(18.)
+            {
+                chosen = Some(entry);
+                break;
+            }
+        }
+
+        if chosen.is_none() {
+            let mut best_score = f32::MAX;
+            for entry in layouts.iter() {
+                let b = entry.2.bounds();
+                if !in_clip(b) {
+                    continue;
+                }
+                let dy = if pos.y < b.top() {
+                    f32::from(b.top() - pos.y)
+                } else if pos.y > b.bottom() {
+                    f32::from(pos.y - b.bottom())
+                } else {
+                    0.0
+                };
+                let dx = if pos.x < b.left() {
+                    f32::from(b.left() - pos.x)
+                } else if pos.x > b.right() {
+                    f32::from(pos.x - b.right())
+                } else {
+                    0.0
+                };
+                let score = dy + dx * 4.0;
+                if score < best_score {
+                    best_score = score;
+                    chosen = Some(entry);
+                }
+            }
+        }
+
+        let (blk_ix, len, layout) = chosen?;
+        let raw_ix = match layout.index_for_position(pos) {
+            Ok(ix) | Err(ix) => ix,
+        }
+        .min(*len);
+        let safe_ix = if let Some(txt) = self.plain_text(*blk_ix) {
+            clamp_to_char_boundary(txt, raw_ix)
+        } else {
+            0
+        };
+        Some(TextPos {
+            block_idx: *blk_ix,
+            byte_offset: safe_ix,
+        })
+    }
+
+    pub fn highlight_at_pos<'a>(
+        &self,
+        highlights: &'a [BookHighlight],
+        pos: TextPos,
+    ) -> Option<&'a BookHighlight> {
+        highlights.iter().rev().find(|hl| {
+            if hl.chapter_idx != self.chapter_idx {
+                return false;
+            }
+            let start = TextPos {
+                block_idx: hl.start_block,
+                byte_offset: hl.start_offset,
+            };
+            let end = TextPos {
+                block_idx: hl.end_block,
+                byte_offset: hl.end_offset,
+            };
+            pos >= start && pos <= end
+        })
+    }
+
+    pub fn selection_handle_points(
+        &self,
+        clip_bounds: Bounds<Pixels>,
+    ) -> (Option<Point<Pixels>>, Option<Point<Pixels>>) {
+        let Some((start, end)) = self.normalized_selection() else {
+            return (None, None);
+        };
+        let layouts = self.rendered_layouts.borrow();
+        let find_pt = |tp: TextPos, bottom: bool| -> Option<Point<Pixels>> {
+            let (_, len, layout) = layouts.iter().find(|(b, _, _)| *b == tp.block_idx)?;
+            let mut pt = layout.position_for_index(tp.byte_offset.min(*len))?;
+            if bottom {
+                pt.y += layout.line_height();
+            }
+            if pt.y < clip_bounds.top() - px(16.) || pt.y > clip_bounds.bottom() + px(16.) {
+                return None;
+            }
+            Some(pt)
+        };
+        (find_pt(start, true), find_pt(end, true))
+    }
+
+    pub fn select_word_at_point(
+        &mut self,
+        pos: Point<Pixels>,
+        clip_bounds: Option<Bounds<Pixels>>,
+    ) -> bool {
+        let Some(hit) = self.hit_test_position(pos, clip_bounds) else {
+            return false;
+        };
+        let Some(txt) = self.plain_text(hit.block_idx) else {
+            return false;
+        };
+        if txt.is_empty() {
+            return false;
+        }
+        let r = word_bounds_at(txt, hit.byte_offset);
+        let (a, b) = if r.start < r.end {
+            (r.start, r.end)
+        } else {
+            (
+                hit.byte_offset,
+                (hit.byte_offset + 1).min(txt.len()),
+            )
+        };
+        self.selection_anchor = Some(TextPos {
+            block_idx: hit.block_idx,
+            byte_offset: a,
+        });
+        self.selection_head = Some(TextPos {
+            block_idx: hit.block_idx,
+            byte_offset: b,
+        });
+        self.draft = None;
+        true
+    }
+
+    pub fn update_handle_drag_at(
+        &mut self,
+        handle: SelectionHandleKind,
+        pos: Point<Pixels>,
+        clip_bounds: Option<Bounds<Pixels>>,
+        last_color: HighlightColor,
+        last_style: HighlightDecoration,
+    ) -> bool {
+        let Some(hit) = self.hit_test_position(pos, clip_bounds) else {
+            return false;
+        };
+        let Some((cur_start, cur_end)) = self.normalized_selection() else {
+            return false;
+        };
+        match handle {
+            SelectionHandleKind::Start => {
+                if hit < cur_end {
+                    self.selection_anchor = Some(hit);
+                    self.selection_head = Some(cur_end);
+                } else {
+                    self.selection_anchor = Some(cur_end);
+                    self.selection_head = Some(hit);
+                }
+            }
+            SelectionHandleKind::End => {
+                if hit > cur_start {
+                    self.selection_anchor = Some(cur_start);
+                    self.selection_head = Some(hit);
+                } else {
+                    self.selection_anchor = Some(hit);
+                    self.selection_head = Some(cur_start);
+                }
+            }
+        }
+        self.sync_draft_from_selection(last_color, last_style);
+        true
+    }
+
+    pub fn sync_draft_from_selection(
+        &mut self,
+        last_color: HighlightColor,
+        last_style: HighlightDecoration,
+    ) {
+        let Some((start, end)) = self.normalized_selection() else {
+            return;
+        };
+        let quote = self.extract_text_for_range(start, end);
+        if quote.trim().is_empty() {
+            return;
+        }
+        if let Some(d) = &mut self.draft {
+            d.start_block = start.block_idx;
+            d.start_offset = start.byte_offset;
+            d.end_block = end.block_idx;
+            d.end_offset = end.byte_offset;
+            d.quote = quote;
+        } else {
+            self.draft = Some(HighlightEditorDraft {
+                start_block: start.block_idx,
+                start_offset: start.byte_offset,
+                end_block: end.block_idx,
+                end_offset: end.byte_offset,
+                quote,
+                existing_id: None,
+                color: last_color,
+                style: last_style,
+            });
+        }
+    }
+
+    pub fn visual_swipe_offset_x(&self) -> f32 {
+        let anim_x = if let Some(anim) = &self.flip_anim {
+            let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
+            let raw_t = (elapsed_ms / (anim.duration_ms.max(1) as f32)).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - raw_t).powi(3);
+            anim.start_x + (anim.target_x - anim.start_x) * eased
+        } else {
+            0.0
+        };
+        self.swipe_offset_x + anim_x
+    }
 }
 
 pub struct BookwormMobileApp {
@@ -138,6 +503,8 @@ pub struct BookwormMobileApp {
 
     pub reader_theme: ReaderTheme,
     pub reader_font_size: f32,
+    pub reader_width: ReaderWidthPref,
+    pub reader_pagination: ReaderPaginationPref,
     pub two_column_spread: bool,
     pub status_banner: Option<String>,
 
@@ -179,6 +546,8 @@ impl BookwormMobileApp {
             ReaderThemePref::Paper => ReaderTheme::Paper,
         };
         let reader_font_size = library_store.reader_prefs.font_size.clamp(13.0, 28.0);
+        let reader_width = library_store.reader_prefs.width;
+        let reader_pagination = library_store.reader_prefs.pagination;
 
         let library_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter books, authors, tags…"));
@@ -249,6 +618,8 @@ impl BookwormMobileApp {
             folder_picker: None,
             reader_theme,
             reader_font_size,
+            reader_width,
+            reader_pagination,
             two_column_spread: cfg.two_column_spread,
             status_banner: initial_banner,
             library_search_input,
@@ -645,7 +1016,8 @@ impl BookwormMobileApp {
         match self.surface {
             AppSurface::Reader => {
                 if let Some(r) = &mut self.reader {
-                    if r.draft.take().is_some() {
+                    if r.draft.is_some() || r.normalized_selection().is_some() {
+                        r.clear_selection_and_draft();
                         window.blur(cx);
                         gpui_mobile::hide_keyboard();
                         cx.notify();
@@ -722,9 +1094,249 @@ impl BookwormMobileApp {
     pub fn reader_current_scroll_pct(&self) -> f32 {
         let max_y = f32::from(self.reader_scroll.max_offset().y);
         if max_y <= 0.0 {
-            0.0
+            return 0.0;
+        }
+        let off_y = if self.reader_pagination == ReaderPaginationPref::Page
+            && let Some(r) = &self.reader
+        {
+            r.page_offsets
+                .borrow()
+                .get(r.current_page)
+                .map(|p| p.0)
+                .unwrap_or_else(|| -f32::from(self.reader_scroll.offset().y))
         } else {
-            (-f32::from(self.reader_scroll.offset().y) / max_y).clamp(0.0, 1.0)
+            -f32::from(self.reader_scroll.offset().y)
+        };
+        (off_y / max_y).clamp(0.0, 1.0)
+    }
+
+    fn collect_reader_line_bands(&self, vp_top_y: f32, cur_off_y: f32) -> Vec<(f32, f32)> {
+        let Some(r) = &self.reader else {
+            return Vec::new();
+        };
+        let layouts = r.rendered_layouts.borrow();
+        let mut bands = Vec::with_capacity(layouts.len() * 3);
+        for (_, _, layout) in layouts.iter() {
+            let b = layout.bounds();
+            let lh = f32::from(layout.line_height()).max(14.0);
+            let top = (f32::from(b.top()) - vp_top_y - cur_off_y).max(0.0);
+            let bot = (f32::from(b.bottom()) - vp_top_y - cur_off_y).max(top);
+            let mut y = top;
+            while y + 0.5 < bot {
+                let next = (y + lh).min(bot);
+                bands.push((y, next));
+                y = next;
+            }
+        }
+        bands
+    }
+
+    pub fn sync_reader_page_layout(&mut self) -> bool {
+        if self.reader_pagination != ReaderPaginationPref::Page {
+            return false;
+        }
+        let scroll_bounds = self.reader_scroll.bounds();
+        let vp_h = f32::from(scroll_bounds.size.height);
+        if vp_h <= 20.0 {
+            return false;
+        }
+        let vp_top_y = f32::from(scroll_bounds.top());
+        let cur_off_y = f32::from(self.reader_scroll.offset().y);
+        let max_y = f32::from(self.reader_scroll.max_offset().y).max(0.0);
+        let has_text = self.reader.as_ref().is_some_and(|r| {
+            r.book
+                .chapters
+                .get(r.chapter_idx)
+                .is_some_and(|c| c.blocks.iter().any(|b| block_plain_text(b).is_some()))
+        });
+        if has_text
+            && self
+                .reader
+                .as_ref()
+                .is_some_and(|r| r.rendered_layouts.borrow().is_empty())
+        {
+            return false;
+        }
+
+        let bands = self.collect_reader_line_bands(vp_top_y, cur_off_y);
+        let total_content_h = vp_h + max_y;
+        let new_pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+
+        let Some(r) = &mut self.reader else {
+            return false;
+        };
+        let mut changed = *r.page_offsets.borrow() != new_pages;
+        *r.page_offsets.borrow_mut() = new_pages;
+        let page_count = r.page_offsets.borrow().len().max(1);
+        if r.pending_last_page {
+            r.pending_last_page = false;
+            r.current_page = page_count - 1;
+            changed = true;
+        } else if r.current_page >= page_count {
+            r.current_page = page_count - 1;
+            changed = true;
+        }
+
+        if let Some((start_y, _)) = r.page_offsets.borrow().get(r.current_page).copied() {
+            let clamped_y = start_y.clamp(0.0, max_y);
+            let actual_y = -f32::from(self.reader_scroll.offset().y);
+            if (actual_y - clamped_y).abs() > 0.5 {
+                self.reader_scroll.set_offset(point(px(0.), px(-clamped_y)));
+                changed = true;
+            }
+        }
+        r.needs_page_recompute = false;
+        changed
+    }
+
+    pub fn reader_start_page_flip_anim(
+        &mut self,
+        start_x: f32,
+        target_x: f32,
+        dir: i8,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(r) = &mut self.reader else {
+            return;
+        };
+        r.flip_anim_gen = r.flip_anim_gen.wrapping_add(1);
+        let anim_gen = r.flip_anim_gen;
+        r.flip_anim = Some(PageFlipAnimation {
+            dir,
+            started_at: Instant::now(),
+            duration_ms: 210,
+            start_x,
+            target_x,
+        });
+        r.swipe_offset_x = 0.0;
+        r.swipe_active = false;
+        let book_rel = r.book_rel.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let mut done = true;
+                let res = this.update(cx, |app, cx| {
+                    let Some(r) = &mut app.reader else {
+                        return;
+                    };
+                    if r.book_rel != book_rel || r.flip_anim_gen != anim_gen {
+                        return;
+                    }
+                    if let Some(anim) = &r.flip_anim {
+                        if anim.started_at.elapsed().as_millis() as u64 >= anim.duration_ms {
+                            r.flip_anim = None;
+                            done = true;
+                        } else {
+                            done = false;
+                        }
+                        cx.notify();
+                    }
+                });
+                if res.is_err() || done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn reader_go_page(&mut self, page_idx: usize, anim_dir: i8, start_x: Option<f32>, cx: &mut Context<Self>) {
+        self.sync_reader_page_layout();
+        let vp_w = self
+            .reader
+            .as_ref()
+            .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
+            .unwrap_or(360.0);
+        if let Some(r) = &mut self.reader {
+            let count = r.page_offsets.borrow().len().max(1);
+            let clamped = page_idx.min(count - 1);
+            r.current_page = clamped;
+            r.clear_selection_and_draft();
+            let max_y = f32::from(self.reader_scroll.max_offset().y).max(0.0);
+            if let Some((start_y, _)) = r.page_offsets.borrow().get(clamped).copied() {
+                self.reader_scroll
+                    .set_offset(point(px(0.), px(-start_y.clamp(0.0, max_y))));
+            }
+        }
+        let pct = self.reader_current_scroll_pct();
+        self.persist_reader_progress(pct);
+        if anim_dir != 0 {
+            let sx = start_x.unwrap_or_else(|| if anim_dir > 0 { vp_w * 0.42 } else { -vp_w * 0.42 });
+            self.reader_start_page_flip_anim(sx, 0.0, anim_dir, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn reader_next_page_or_chapter(
+        &mut self,
+        start_x: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reader_pagination == ReaderPaginationPref::Page {
+            self.sync_reader_page_layout();
+            if let Some(r) = &self.reader {
+                let count = r.page_offsets.borrow().len();
+                if r.current_page + 1 < count {
+                    let next_p = r.current_page + 1;
+                    self.reader_go_page(next_p, 1, start_x, cx);
+                    return;
+                }
+                let next_ch = r.chapter_idx + 1;
+                if next_ch < r.book.chapters.len() {
+                    let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
+                    self.reader_go_chapter(next_ch, window, cx);
+                    self.reader_start_page_flip_anim(start_x.unwrap_or(vp_w * 0.45), 0.0, 1, cx);
+                }
+            }
+            return;
+        }
+        if let Some(r) = &self.reader {
+            let next_ch = r.chapter_idx + 1;
+            if next_ch < r.book.chapters.len() {
+                let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
+                self.reader_go_chapter(next_ch, window, cx);
+                self.reader_start_page_flip_anim(start_x.unwrap_or(vp_w * 0.42), 0.0, 1, cx);
+            }
+        }
+    }
+
+    pub fn reader_prev_page_or_chapter(
+        &mut self,
+        start_x: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reader_pagination == ReaderPaginationPref::Page {
+            self.sync_reader_page_layout();
+            if let Some(r) = &self.reader {
+                if r.current_page > 0 {
+                    let prev_p = r.current_page - 1;
+                    self.reader_go_page(prev_p, -1, start_x, cx);
+                    return;
+                }
+                if r.chapter_idx > 0 {
+                    let prev_ch = r.chapter_idx - 1;
+                    let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
+                    self.reader_go_chapter(prev_ch, window, cx);
+                    if let Some(r) = &mut self.reader {
+                        r.pending_last_page = true;
+                        r.needs_page_recompute = true;
+                    }
+                    self.reader_start_page_flip_anim(start_x.unwrap_or(-vp_w * 0.45), 0.0, -1, cx);
+                }
+            }
+            return;
+        }
+        if let Some(r) = &self.reader
+            && r.chapter_idx > 0
+        {
+            let prev_ch = r.chapter_idx - 1;
+            let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
+            self.reader_go_chapter(prev_ch, window, cx);
+            self.reader_start_page_flip_anim(start_x.unwrap_or(-vp_w * 0.42), 0.0, -1, cx);
         }
     }
 
@@ -844,14 +1456,37 @@ impl BookwormMobileApp {
                 drop(layouts);
                 r.pending_scroll_block = None;
                 r.pending_scroll_fraction = None;
-                if max_y > 0.0 {
-                    self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
-                }
-                r.last_saved_scroll_pct = if max_y > 0.0 {
-                    (target_y / max_y).clamp(0.0, 1.0)
+                if self.reader_pagination == ReaderPaginationPref::Page {
+                    let total_content_h = vp_h + max_y.max(0.0);
+                    let bands = self.collect_reader_line_bands(vp_top_y, cur_off_y);
+                    let pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+                    let p_ix = page_index_for_content_y(&pages, target_y);
+                    let snapped = pages.get(p_ix).map(|p| p.0).unwrap_or(0.0).clamp(0.0, max_y.max(0.0));
+                    if let Some(r) = &mut self.reader {
+                        r.current_page = p_ix;
+                        *r.page_offsets.borrow_mut() = pages;
+                        r.needs_page_recompute = false;
+                        r.last_saved_scroll_pct = if max_y > 0.0 {
+                            (snapped / max_y).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                    if max_y > 0.0 {
+                        self.reader_scroll.set_offset(point(px(0.), px(-snapped)));
+                    }
                 } else {
-                    0.0
-                };
+                    if max_y > 0.0 {
+                        self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
+                    }
+                    if let Some(r) = &mut self.reader {
+                        r.last_saved_scroll_pct = if max_y > 0.0 {
+                            (target_y / max_y).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                }
                 return true;
             }
             drop(layouts);
@@ -860,11 +1495,36 @@ impl BookwormMobileApp {
 
         if let Some(frac) = r.pending_scroll_fraction.take() {
             let clamped = frac.clamp(0.0, 1.0);
-            if max_y > 0.0 {
-                let target_y = (clamped * max_y).clamp(0.0, max_y);
-                self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
+            let target_y = if max_y > 0.0 {
+                (clamped * max_y).clamp(0.0, max_y)
+            } else {
+                0.0
+            };
+            if self.reader_pagination == ReaderPaginationPref::Page {
+                let cur_off_y = f32::from(self.reader_scroll.offset().y);
+                let vp_top_y = f32::from(scroll_bounds.top());
+                let total_content_h = vp_h + max_y.max(0.0);
+                let bands = self.collect_reader_line_bands(vp_top_y, cur_off_y);
+                let pages = compute_chapter_page_offsets(vp_h, total_content_h, &bands);
+                let p_ix = page_index_for_content_y(&pages, target_y);
+                let snapped = pages.get(p_ix).map(|p| p.0).unwrap_or(0.0).clamp(0.0, max_y.max(0.0));
+                if let Some(r) = &mut self.reader {
+                    r.current_page = p_ix;
+                    *r.page_offsets.borrow_mut() = pages;
+                    r.needs_page_recompute = false;
+                    r.last_saved_scroll_pct = clamped;
+                }
+                if max_y > 0.0 {
+                    self.reader_scroll.set_offset(point(px(0.), px(-snapped)));
+                }
+            } else {
+                if max_y > 0.0 {
+                    self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
+                }
+                if let Some(r) = &mut self.reader {
+                    r.last_saved_scroll_pct = clamped;
+                }
             }
-            r.last_saved_scroll_pct = clamped;
         }
         true
     }
@@ -970,6 +1630,22 @@ impl BookwormMobileApp {
             notes_color_filter: None,
             notes_only_filter: false,
             draft: None,
+            viewport_bounds: Rc::new(Cell::new(Bounds::default())),
+            page_offsets: Rc::new(RefCell::new(vec![(0.0, 600.0)])),
+            current_page: 0,
+            pending_last_page: false,
+            needs_page_recompute: true,
+            selection_anchor: None,
+            selection_head: None,
+            is_long_press_selecting: false,
+            dragging_handle: None,
+            mouse_down_pos: None,
+            is_mouse_selecting: false,
+            swipe_offset_x: 0.0,
+            swipe_active: false,
+            swipe_ignore_momentum: false,
+            flip_anim: None,
+            flip_anim_gen: 0,
             rendered_layouts: Rc::new(RefCell::new(Vec::new())),
             decoded_images: RefCell::new(HashMap::new()),
             pending_scroll_block: None,
@@ -994,7 +1670,11 @@ impl BookwormMobileApp {
             r.chapter_idx = clamped;
             r.show_toc = false;
             r.show_notes = false;
-            r.draft = None;
+            r.clear_selection_and_draft();
+            r.current_page = 0;
+            r.pending_last_page = false;
+            r.needs_page_recompute = true;
+            *r.page_offsets.borrow_mut() = vec![(0.0, 600.0)];
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = None;
@@ -1069,56 +1749,90 @@ impl BookwormMobileApp {
         cx.notify();
     }
 
-    pub fn reader_open_highlight_draft(
+    pub fn reader_open_existing_highlight(
         &mut self,
-        block_idx: usize,
+        hl: &BookHighlight,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.highlight_note_input
+            .update(cx, |inp, cx| inp.set_value(hl.note.clone(), window, cx));
         if let Some(r) = &mut self.reader {
-            let Some(blk) = r
-                .book
-                .chapters
-                .get(r.chapter_idx)
-                .and_then(|c| c.blocks.get(block_idx))
-            else {
-                return;
-            };
-            let quote = match blk {
-                EpubBlock::Paragraph { text, .. }
-                | EpubBlock::ListItem { text, .. }
-                | EpubBlock::Heading { text, .. } => text.clone(),
-                EpubBlock::Image { .. } | EpubBlock::Rule => return,
-            };
-            let existing = self.library_store.books.get(&r.book_rel).and_then(|u| {
-                u.highlights.iter().find(|h| {
-                    h.chapter_idx == r.chapter_idx
-                        && block_idx >= h.start_block
-                        && block_idx <= h.end_block
-                })
+            r.selection_anchor = Some(TextPos {
+                block_idx: hl.start_block,
+                byte_offset: hl.start_offset,
             });
-
-            let (existing_id, color, style, note_txt) = if let Some(hl) = existing {
-                (Some(hl.id.clone()), hl.color, hl.style, hl.note.clone())
-            } else {
-                (
-                    None,
-                    self.library_store.reader_prefs.last_highlight_color,
-                    self.library_store.reader_prefs.last_highlight_style,
-                    String::new(),
-                )
-            };
-
-            self.highlight_note_input
-                .update(cx, |inp, cx| inp.set_value(note_txt, window, cx));
+            r.selection_head = Some(TextPos {
+                block_idx: hl.end_block,
+                byte_offset: hl.end_offset,
+            });
             r.draft = Some(HighlightEditorDraft {
-                block_idx,
-                quote,
-                existing_id,
-                color,
-                style,
+                start_block: hl.start_block,
+                start_offset: hl.start_offset,
+                end_block: hl.end_block,
+                end_offset: hl.end_offset,
+                quote: hl.quote.clone(),
+                existing_id: Some(hl.id.clone()),
+                color: hl.color,
+                style: hl.style,
             });
         }
+        cx.notify();
+    }
+
+    pub fn reader_finalize_selection_draft(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let last_color = self.library_store.reader_prefs.last_highlight_color;
+        let last_style = self.library_store.reader_prefs.last_highlight_style;
+        let has_sel = if let Some(r) = &mut self.reader {
+            r.sync_draft_from_selection(last_color, last_style);
+            r.draft.is_some()
+        } else {
+            false
+        };
+        if has_sel {
+            let note_val = self
+                .reader
+                .as_ref()
+                .and_then(|r| {
+                    let book_rel = &r.book_rel;
+                    r.draft.as_ref().and_then(|d| {
+                        d.existing_id.as_ref().and_then(|id| {
+                            self.library_store
+                                .books
+                                .get(book_rel)
+                                .and_then(|u| u.highlights.iter().find(|h| &h.id == id))
+                                .map(|h| h.note.clone())
+                        })
+                    })
+                })
+                .unwrap_or_default();
+            self.highlight_note_input
+                .update(cx, |inp, cx| inp.set_value(note_val, window, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn reader_copy_active_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = &mut self.reader {
+            let text = if let Some((s, e)) = r.normalized_selection() {
+                r.extract_text_for_range(s, e)
+            } else if let Some(d) = &r.draft {
+                d.quote.clone()
+            } else {
+                String::new()
+            };
+            if !text.trim().is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.status_banner = Some("Copied selection to clipboard".to_string());
+            }
+            r.clear_selection_and_draft();
+        }
+        window.blur(cx);
+        gpui_mobile::hide_keyboard();
         cx.notify();
     }
 
@@ -1127,6 +1841,10 @@ impl BookwormMobileApp {
         if let Some(r) = &mut self.reader
             && let Some(d) = r.draft.take()
         {
+            r.selection_anchor = None;
+            r.selection_head = None;
+            r.is_long_press_selecting = false;
+            r.dragging_handle = None;
             let ch_title = r
                 .book
                 .chapters
@@ -1138,11 +1856,10 @@ impl BookwormMobileApp {
                 format!(
                     "hl-{}-{}-{}",
                     r.chapter_idx,
-                    d.block_idx,
+                    d.start_block,
                     chrono::Utc::now().timestamp_millis()
                 )
             });
-            let end_offset = d.quote.len();
             self.library_store.reader_prefs.last_highlight_color = d.color;
             self.library_store.reader_prefs.last_highlight_style = d.style;
             self.library_store.upsert_highlight(
@@ -1151,10 +1868,10 @@ impl BookwormMobileApp {
                     id,
                     chapter_idx: r.chapter_idx,
                     chapter_title: ch_title,
-                    start_block: d.block_idx,
-                    start_offset: 0,
-                    end_block: d.block_idx,
-                    end_offset,
+                    start_block: d.start_block,
+                    start_offset: d.start_offset,
+                    end_block: d.end_block,
+                    end_offset: d.end_offset,
                     quote: d.quote,
                     color: d.color,
                     style: d.style,
@@ -1171,12 +1888,15 @@ impl BookwormMobileApp {
     }
 
     pub fn reader_delete_draft_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = &mut self.reader
-            && let Some(d) = r.draft.take()
-            && let Some(id) = d.existing_id
-        {
-            self.library_store.delete_highlight(&r.book_rel, &id);
-            let _ = self.library_store.sync_save(&self.library_state_root);
+        if let Some(r) = &mut self.reader {
+            r.selection_anchor = None;
+            r.selection_head = None;
+            if let Some(d) = r.draft.take()
+                && let Some(id) = d.existing_id
+            {
+                self.library_store.delete_highlight(&r.book_rel, &id);
+                let _ = self.library_store.sync_save(&self.library_state_root);
+            }
         }
         window.blur(cx);
         gpui_mobile::hide_keyboard();
@@ -1214,12 +1934,48 @@ impl BookwormMobileApp {
     pub fn adjust_reader_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.reader_font_size = (self.reader_font_size + delta).clamp(13.0, 28.0);
         self.library_store.reader_prefs.font_size = self.reader_font_size;
+        if let Some(r) = &mut self.reader {
+            r.needs_page_recompute = true;
+        }
+        let _ = self.library_store.sync_save(&self.library_state_root);
+        cx.notify();
+    }
+
+    pub fn set_reader_width(&mut self, width: ReaderWidthPref, cx: &mut Context<Self>) {
+        self.reader_width = width;
+        self.library_store.reader_prefs.width = width;
+        if let Some(r) = &mut self.reader {
+            r.rendered_layouts.borrow_mut().clear();
+            r.needs_page_recompute = true;
+        }
+        let _ = self.library_store.sync_save(&self.library_state_root);
+        cx.notify();
+    }
+
+    pub fn toggle_reader_pagination(&mut self, cx: &mut Context<Self>) {
+        let frac = self.reader_current_scroll_pct();
+        self.reader_pagination = self.reader_pagination.toggle();
+        self.library_store.reader_prefs.pagination = self.reader_pagination;
+        if let Some(r) = &mut self.reader {
+            r.needs_page_recompute = true;
+            r.pending_last_page = false;
+            if self.reader_pagination == ReaderPaginationPref::Page {
+                r.pending_scroll_fraction = Some(frac);
+            }
+        }
+        if self.reader_pagination == ReaderPaginationPref::Page {
+            self.schedule_pending_reader_scroll(cx);
+        }
         let _ = self.library_store.sync_save(&self.library_state_root);
         cx.notify();
     }
 
     pub fn toggle_two_column_spread(&mut self, cx: &mut Context<Self>) {
         self.two_column_spread = !self.two_column_spread;
+        if let Some(r) = &mut self.reader {
+            r.rendered_layouts.borrow_mut().clear();
+            r.needs_page_recompute = true;
+        }
         self.persist_mobile_config(cx);
         cx.notify();
     }

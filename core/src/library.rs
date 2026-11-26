@@ -283,15 +283,21 @@ pub enum ReaderWidthPref {
     Standard,
     Wide,
     TwoColumn,
+    Full,
 }
 
 impl ReaderWidthPref {
+    pub fn all_single_column() -> &'static [ReaderWidthPref] {
+        &[Self::Narrow, Self::Standard, Self::Wide, Self::Full]
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Narrow => "Narrow",
-            Self::Standard => "Standard",
+            Self::Standard => "Comfort",
             Self::Wide => "Wide",
             Self::TwoColumn => "2-Col",
+            Self::Full => "Full",
         }
     }
 
@@ -300,18 +306,128 @@ impl ReaderWidthPref {
             Self::Narrow => Self::Standard,
             Self::Standard => Self::Wide,
             Self::Wide => Self::TwoColumn,
-            Self::TwoColumn => Self::Narrow,
+            Self::TwoColumn => Self::Full,
+            Self::Full => Self::Narrow,
+        }
+    }
+
+    pub fn max_width_px_opt(self) -> Option<f32> {
+        match self {
+            Self::Narrow => Some(560.0),
+            Self::Standard => Some(700.0),
+            Self::Wide => Some(900.0),
+            Self::TwoColumn => Some(1140.0),
+            Self::Full => None,
         }
     }
 
     pub fn max_width_px(self) -> f32 {
+        self.max_width_px_opt().unwrap_or(100_000.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReaderPaginationPref {
+    #[default]
+    Scroll,
+    Page,
+}
+
+impl ReaderPaginationPref {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Narrow => 560.0,
-            Self::Standard => 700.0,
-            Self::Wide => 900.0,
-            Self::TwoColumn => 1140.0,
+            Self::Scroll => "Scroll",
+            Self::Page => "Page",
         }
     }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Scroll => Self::Page,
+            Self::Page => Self::Scroll,
+        }
+    }
+}
+
+/// Computes discrete `(page_start_y, page_clip_h)` slices for a chapter so page breaks
+/// snap cleanly between text lines and never horizontally slice a line in half.
+/// `line_bands` must contain `(top_y, bottom_y)` spans in content coordinates (origin at 0.0).
+pub fn compute_chapter_page_offsets(
+    viewport_h: f32,
+    total_content_h: f32,
+    line_bands: &[(f32, f32)],
+) -> Vec<(f32, f32)> {
+    if viewport_h <= 1.0 || total_content_h <= viewport_h + 2.0 {
+        return vec![(0.0, viewport_h.max(1.0))];
+    }
+
+    let usable_h = (viewport_h - 14.0).max(viewport_h * 0.65).max(80.0);
+    let mut bands: Vec<(f32, f32)> = line_bands
+        .iter()
+        .copied()
+        .filter(|&(t, b)| b > t + 0.5)
+        .collect();
+    bands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+    let mut pages = Vec::new();
+    let mut y = 0.0_f32;
+    let max_iterations = ((total_content_h / 24.0).ceil() as usize).clamp(4, 2000);
+
+    for _ in 0..max_iterations {
+        let remaining = total_content_h - y;
+        if remaining <= viewport_h + 2.0 {
+            let clip = remaining.clamp(40.0, viewport_h);
+            pages.push((y, clip));
+            break;
+        }
+
+        let raw_cut = y + usable_h;
+        let min_progress = y + usable_h * 0.35;
+        let mut cut = raw_cut;
+
+        for &(top, bot) in &bands {
+            if top > raw_cut + 1.0 {
+                break;
+            }
+            if top < raw_cut && bot > raw_cut && top > min_progress {
+                cut = cut.min(top);
+            }
+        }
+
+        if cut <= y + 24.0 {
+            cut = (y + usable_h).min(total_content_h);
+        }
+
+        let clip_h = (cut - y).clamp(40.0, viewport_h);
+        pages.push((y, clip_h));
+        if cut >= total_content_h - 2.0 {
+            break;
+        }
+        y = cut;
+    }
+
+    if pages.is_empty() {
+        pages.push((0.0, viewport_h.max(1.0)));
+    }
+    pages
+}
+
+/// Finds the page index in `pages` (`(start_y, clip_h)`) that contains `content_y`.
+pub fn page_index_for_content_y(pages: &[(f32, f32)], content_y: f32) -> usize {
+    if pages.len() <= 1 {
+        return 0;
+    }
+    let y = content_y.max(0.0);
+    let mut best = 0usize;
+    for (ix, &(start_y, _)) in pages.iter().enumerate() {
+        if start_y <= y + 4.0 {
+            best = ix;
+        } else {
+            break;
+        }
+    }
+    best
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +473,7 @@ pub struct ReaderPrefs {
     pub font: ReaderFontPref,
     pub width: ReaderWidthPref,
     pub spacing: ReaderSpacingPref,
+    pub pagination: ReaderPaginationPref,
     pub last_highlight_color: HighlightColor,
     pub last_highlight_style: HighlightDecoration,
 }
@@ -369,6 +486,7 @@ impl Default for ReaderPrefs {
             font: ReaderFontPref::Serif,
             width: ReaderWidthPref::Standard,
             spacing: ReaderSpacingPref::Normal,
+            pagination: ReaderPaginationPref::Scroll,
             last_highlight_color: HighlightColor::Yellow,
             last_highlight_style: HighlightDecoration::Highlight,
         }
@@ -1778,5 +1896,40 @@ mod tests {
         assert_eq!(final_a.rating, 5);
         assert_eq!(final_a.highlights.len(), 1);
         assert_eq!(final_a.highlights[0].id, "hl-remote");
+    }
+
+    #[test]
+    fn compute_chapter_page_offsets_snaps_between_lines_and_clamps() {
+        // Short chapter fits in 1 page
+        let single = compute_chapter_page_offsets(600.0, 500.0, &[(20.0, 48.0)]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].0, 0.0);
+
+        // Multi-page chapter with a line straddling usable_h (600 - 14 = 586)
+        // Band (570.0, 602.0) straddles 586.0 -> cut should snap cleanly to 570.0!
+        let bands = vec![
+            (20.0, 50.0),
+            (540.0, 568.0),
+            (570.0, 602.0),
+            (1130.0, 1165.0),
+        ];
+        let pages = compute_chapter_page_offsets(600.0, 1300.0, &bands);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].0, 0.0);
+        assert!((pages[0].1 - 570.0).abs() < 1e-3);
+        assert!((pages[1].0 - 570.0).abs() < 1e-3);
+        assert_eq!(page_index_for_content_y(&pages, 580.0), 1);
+
+        // Zero / tiny viewport still produces 1 safe page
+        assert_eq!(compute_chapter_page_offsets(0.0, 500.0, &[]).len(), 1);
+    }
+
+    #[test]
+    fn reader_prefs_deserializes_legacy_json_without_pagination_or_full_width() {
+        let legacy = r#"{"font_size":18.0,"theme":"sepia","width":"standard"}"#;
+        let prefs: ReaderPrefs = serde_json::from_str(legacy).unwrap();
+        assert_eq!(prefs.width, ReaderWidthPref::Standard);
+        assert_eq!(prefs.pagination, ReaderPaginationPref::Scroll);
+        assert_eq!(ReaderWidthPref::Full.max_width_px_opt(), None);
     }
 }
