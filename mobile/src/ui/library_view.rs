@@ -635,6 +635,38 @@ pub fn render_library_tab(
         .size_full()
         .child(header)
         .child(root_bar)
+        .when(!app.has_storage_access, |col| {
+            col.child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .justify_between()
+                    .items_center()
+                    .bg(hex_alpha(0xc4b28a20))
+                    .border_b_1()
+                    .border_color(hex_color(kd::YELLOW))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hex_color(kd::YELLOW))
+                            .child("All files access needed to read EPUBs & highlights in /sdcard"),
+                    )
+                    .child(
+                        Button::new("lib-grant-storage")
+                            .primary()
+                            .small()
+                            .label("Grant Access")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_storage_permission(cx);
+                            })),
+                    ),
+            )
+        })
         .when_some(app.status_banner.clone(), |col, msg| {
             col.child(
                 h_flex()

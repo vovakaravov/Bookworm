@@ -42,16 +42,7 @@ pub fn app_cache_dir(subdir: &str) -> PathBuf {
 pub fn has_external_storage_access() -> bool {
     #[cfg(target_os = "android")]
     {
-        for p in [
-            Path::new("/sdcard/Documents/Library"),
-            Path::new("/sdcard/Documents"),
-            Path::new("/sdcard"),
-        ] {
-            if p.is_dir() && fs::read_dir(p).is_ok() {
-                return true;
-            }
-        }
-        false
+        crate::has_all_files_access()
     }
     #[cfg(not(target_os = "android"))]
     {

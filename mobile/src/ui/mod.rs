@@ -520,7 +520,9 @@ pub struct BookwormMobileApp {
     pub folder_picker_scroll: ScrollHandle,
 
     last_back_at: Option<Instant>,
+    last_resume_epoch: u64,
     _library_task: Option<Task<()>>,
+    _perm_poll_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -632,7 +634,9 @@ impl BookwormMobileApp {
             settings_scroll: ScrollHandle::new(),
             folder_picker_scroll: ScrollHandle::new(),
             last_back_at: None,
+            last_resume_epoch: crate::android_resume_epoch(),
             _library_task: None,
+            _perm_poll_task: None,
             _subs: subs,
         };
 
@@ -733,18 +737,49 @@ impl BookwormMobileApp {
     }
 
     pub fn recheck_storage_and_refresh(&mut self, cx: &mut Context<Self>) {
+        let was_granted = self.has_storage_access;
         let access = has_external_storage_access();
         self.has_storage_access = access;
         let fallback_books = app_storage_dir("books");
+        let mut root_changed = false;
         if access && (!can_read_dir(&self.books_root) || self.books_root == fallback_books) {
             let detected = default_books_root();
             self.books_root = detected.clone();
             self.library_state_root = state_root_for(&detected);
+            root_changed = true;
+        }
+        if access && (!was_granted || root_changed) {
             self.library_store = LibraryStore::load(&self.library_state_root);
+            self.status_banner =
+                Some("All files access granted — scanning library…".to_string());
         }
         self.books_root_candidates = books_root_candidates(&self.books_root);
         self.persist_mobile_config(cx);
         self.refresh_library_async(cx);
+    }
+
+    pub fn request_storage_permission(&mut self, cx: &mut Context<Self>) {
+        let start_epoch = crate::android_resume_epoch();
+        crate::request_all_files_access();
+        self.status_banner = Some(
+            "Toggle \"Allow access to manage all files\", then press Back.".to_string(),
+        );
+        cx.notify();
+
+        self._perm_poll_task = Some(cx.spawn(async move |weak_self, cx| {
+            for _ in 0..340u32 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(350))
+                    .await;
+                if crate::android_resume_epoch() != start_epoch || crate::has_all_files_access() {
+                    let _ = weak_self.update(cx, |this, cx| {
+                        this.last_resume_epoch = crate::android_resume_epoch();
+                        this.recheck_storage_and_refresh(cx);
+                    });
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn set_books_root(&mut self, new_root: PathBuf, cx: &mut Context<Self>) {
@@ -2044,6 +2079,14 @@ fn nav_tab_item(
 
 impl Render for BookwormMobileApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let epoch = crate::android_resume_epoch();
+        if epoch != self.last_resume_epoch {
+            self.last_resume_epoch = epoch;
+            let access = crate::has_all_files_access();
+            if access != self.has_storage_access {
+                self.recheck_storage_and_refresh(cx);
+            }
+        }
         self.safe_area = Self::query_safe_area();
         let kb_height = gpui_mobile::keyboard_height();
         let bottom_inset = self.safe_area.bottom.max(kb_height);
