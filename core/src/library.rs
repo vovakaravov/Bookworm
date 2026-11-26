@@ -674,6 +674,67 @@ impl ReaderSpacingPref {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DictDefLang {
+    #[default]
+    En,
+    Ru,
+    ZhHans,
+}
+
+impl DictDefLang {
+    pub fn all() -> &'static [Self] {
+        &[Self::En, Self::Ru, Self::ZhHans]
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ru => "ru",
+            Self::ZhHans => "zh",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::Ru => "Русский",
+            Self::ZhHans => "中文 (简体)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::En => "EN",
+            Self::Ru => "RU",
+            Self::ZhHans => "中文",
+        }
+    }
+
+    pub fn pack_filename(self) -> &'static str {
+        match self {
+            Self::En => "def-en.db",
+            Self::Ru => "def-ru.db",
+            Self::ZhHans => "def-zh.db",
+        }
+    }
+
+    pub fn pack_url(self) -> &'static str {
+        match self {
+            Self::En => {
+                "https://github.com/vovakaravov/Bookworm/releases/download/dict-v2/bookworm-dict-def-en.db.gz"
+            }
+            Self::Ru => {
+                "https://github.com/vovakaravov/Bookworm/releases/download/dict-v2/bookworm-dict-def-ru.db.gz"
+            }
+            Self::ZhHans => {
+                "https://github.com/vovakaravov/Bookworm/releases/download/dict-v2/bookworm-dict-def-zh.db.gz"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReaderPrefs {
@@ -685,6 +746,7 @@ pub struct ReaderPrefs {
     pub pagination: ReaderPaginationPref,
     pub last_highlight_color: HighlightColor,
     pub last_highlight_style: HighlightDecoration,
+    pub dict_def_lang: DictDefLang,
 }
 
 impl Default for ReaderPrefs {
@@ -698,6 +760,7 @@ impl Default for ReaderPrefs {
             pagination: ReaderPaginationPref::Page,
             last_highlight_color: HighlightColor::Yellow,
             last_highlight_style: HighlightDecoration::Highlight,
+            dict_def_lang: DictDefLang::En,
         }
     }
 }
@@ -1735,11 +1798,20 @@ pub fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+pub fn is_cjk_char(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
 pub fn word_bounds_at(s: &str, byte_idx: usize) -> std::ops::Range<usize> {
     let idx = clamp_to_char_boundary(s, byte_idx);
-    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '\'' | '\u{2019}' | '-');
+    let is_word = |c: char| {
+        !is_cjk_char(c) && (c.is_alphanumeric() || matches!(c, '_' | '\'' | '\u{2019}' | '-'))
+    };
 
     if let Some(ch) = s[idx..].chars().next() {
+        if is_cjk_char(ch) {
+            return idx..(idx + ch.len_utf8());
+        }
         if is_word(ch) {
             let mut start = idx;
             for (rel_ix, c) in s[..idx].char_indices().rev() {
@@ -1761,8 +1833,32 @@ pub fn word_bounds_at(s: &str, byte_idx: usize) -> std::ops::Range<usize> {
         }
         if idx > 0
             && let Some(prev) = s[..idx].chars().next_back()
-            && is_word(prev)
         {
+            if is_cjk_char(prev) {
+                return (idx - prev.len_utf8())..idx;
+            }
+            if is_word(prev) {
+                let mut start = idx;
+                for (rel_ix, c) in s[..idx].char_indices().rev() {
+                    if is_word(c) {
+                        start = rel_ix;
+                    } else {
+                        break;
+                    }
+                }
+                return start..idx;
+            }
+        }
+        if !ch.is_whitespace() {
+            return idx..(idx + ch.len_utf8());
+        }
+    } else if idx > 0
+        && let Some(prev) = s[..idx].chars().next_back()
+    {
+        if is_cjk_char(prev) {
+            return (idx - prev.len_utf8())..idx;
+        }
+        if is_word(prev) {
             let mut start = idx;
             for (rel_ix, c) in s[..idx].char_indices().rev() {
                 if is_word(c) {
@@ -1773,24 +1869,76 @@ pub fn word_bounds_at(s: &str, byte_idx: usize) -> std::ops::Range<usize> {
             }
             return start..idx;
         }
-        if !ch.is_whitespace() {
-            return idx..(idx + ch.len_utf8());
-        }
-    } else if idx > 0
-        && let Some(prev) = s[..idx].chars().next_back()
-        && is_word(prev)
-    {
-        let mut start = idx;
-        for (rel_ix, c) in s[..idx].char_indices().rev() {
-            if is_word(c) {
-                start = rel_ix;
-            } else {
-                break;
-            }
-        }
-        return start..idx;
     }
     idx..idx
+}
+
+/// Snaps a hit inside CJK text to the longest matching 2–4 character compound in `has_entry`,
+/// falling back to the single CJK character at `byte_idx` (or standard word bounds for non-CJK).
+pub fn cjk_word_bounds_at<F>(s: &str, byte_idx: usize, mut has_entry: F) -> std::ops::Range<usize>
+where
+    F: FnMut(&str) -> bool,
+{
+    let idx = clamp_to_char_boundary(s, byte_idx);
+    let Some(ch) = s[idx..].chars().next() else {
+        return word_bounds_at(s, idx);
+    };
+    if !is_cjk_char(ch) {
+        return word_bounds_at(s, idx);
+    }
+
+    let mut before_starts: Vec<usize> = Vec::new();
+    for (rel_ix, c) in s[..idx].char_indices().rev() {
+        if is_cjk_char(c) {
+            before_starts.push(rel_ix);
+            if before_starts.len() >= 3 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    before_starts.reverse();
+
+    let target_pos = before_starts.len();
+    let mut bounds: Vec<usize> = before_starts;
+    bounds.push(idx);
+    let mut cur_end = idx + ch.len_utf8();
+    bounds.push(cur_end);
+
+    let mut after_count = 0usize;
+    for (rel_ix, c) in s[cur_end..].char_indices() {
+        if is_cjk_char(c) {
+            let next_end = cur_end + rel_ix + c.len_utf8();
+            bounds.push(next_end);
+            after_count += 1;
+            if after_count >= 3 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let _ = &mut cur_end;
+    let total_chars = bounds.len() - 1;
+
+    for len in (2..=4usize).rev() {
+        if total_chars < len {
+            continue;
+        }
+        let min_start = target_pos.saturating_sub(len - 1);
+        let max_start = target_pos.min(total_chars - len);
+        // Prefer spans starting right at the clicked character first, then leftward shifts.
+        for start_ci in (min_start..=max_start).rev() {
+            let end_ci = start_ci + len;
+            let span = bounds[start_ci]..bounds[end_ci];
+            if has_entry(&s[span.clone()]) {
+                return span;
+            }
+        }
+    }
+
+    idx..(idx + ch.len_utf8())
 }
 
 #[cfg(test)]
@@ -2246,5 +2394,22 @@ mod tests {
         // Empty chapter still produces 1 empty page
         let empty = paginate_measured_blocks(&[], 400.0, 60.0, 12.0);
         assert_eq!(empty.len(), 1);
+    }
+
+    #[test]
+    fn cjk_word_bounds_snaps_to_known_compounds_and_defaults_to_single_char() {
+        let sentence = "我喜欢阅读书籍";
+        let read_idx = sentence.find('阅').unwrap();
+        let du_idx = sentence.find('读').unwrap();
+
+        // Without dictionary knowledge, word_bounds_at selects a single CJK char
+        let r_single = word_bounds_at(sentence, read_idx);
+        assert_eq!(&sentence[r_single], "阅");
+
+        // With compound matcher, tapping either character in 阅读 snaps to 阅读
+        let r1 = super::cjk_word_bounds_at(sentence, read_idx, |w| w == "阅读" || w == "喜欢");
+        assert_eq!(&sentence[r1], "阅读");
+        let r2 = super::cjk_word_bounds_at(sentence, du_idx, |w| w == "阅读" || w == "喜欢");
+        assert_eq!(&sentence[r2], "阅读");
     }
 }

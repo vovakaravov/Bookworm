@@ -4,7 +4,7 @@ use bookworm_core::epub::{
     EpubCoverData, EpubMetadata, image_media_type_for_path, write_epub_metadata,
 };
 use bookworm_core::library::{
-    BookBookmark, BookFormat, BookHighlight, BookRecord, LibraryStore, ReadingStatus,
+    BookBookmark, BookFormat, BookHighlight, BookRecord, DictDefLang, LibraryStore, ReadingStatus,
     scan_library, suggested_book_filename,
 };
 use bookworm_core::metadata::{
@@ -97,7 +97,8 @@ pub enum LibraryViewEvent {
         new_path: PathBuf,
     },
     ExportNotes,
-    DownloadDictionary,
+    SetDictDefLang(DictDefLang),
+    DownloadDictionary(DictDefLang),
     StatusToast(String),
     ErrorToast(String),
 }
@@ -2602,17 +2603,41 @@ impl Render for LibraryView {
                                 cx.emit(LibraryViewEvent::ExportNotes);
                             })),
                     )
-                    .child(
-                        Button::new("lib-download-dict")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::BookOpen)
-                            .label("EN/RU Dict")
-                            .tooltip("Download / Update Offline EN/RU Dictionary Pack")
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(LibraryViewEvent::DownloadDictionary);
-                            })),
-                    )
+                    .child({
+                        let def_lang = self.store.reader_prefs.dict_def_lang;
+                        let next_def = match def_lang {
+                            DictDefLang::En => DictDefLang::Ru,
+                            DictDefLang::Ru => DictDefLang::ZhHans,
+                            DictDefLang::ZhHans => DictDefLang::En,
+                        };
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("lib-dict-lang")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(format!("Def: {}", def_lang.short_label()))
+                                    .tooltip("Cycle Dictionary Definition Language (English / Русский / 中文)")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(LibraryViewEvent::SetDictDefLang(next_def));
+                                    })),
+                            )
+                            .child(
+                                Button::new("lib-download-dict")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::BookOpen)
+                                    .label(format!("Dict ({})", def_lang.short_label()))
+                                    .tooltip(format!(
+                                        "Download / Update Offline {} Dictionary Pack",
+                                        def_lang.label()
+                                    ))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(LibraryViewEvent::DownloadDictionary(def_lang));
+                                    })),
+                            )
+                    })
                     .child(
                         Button::new("lib-refresh")
                             .ghost()

@@ -1885,6 +1885,9 @@ pub fn render_reader_view(
                                             .timer(Duration::from_millis(360))
                                             .await;
                                         let _ = this.update(cx, |app, cx| {
+                                            let dict_rc = app.dict_store.clone();
+                                            let def_lang = app.dict_def_lang;
+                                            let dict_ref = dict_rc.borrow();
                                             let Some(r) = &mut app.reader else {
                                                 return;
                                             };
@@ -1895,7 +1898,11 @@ pub fn render_reader_view(
                                                 return;
                                             }
                                             let lp_pos = r.page_touch_cur_pos;
-                                            if r.select_word_at_point(lp_pos, Some(lp_bounds)) {
+                                            if r.select_word_at_point(
+                                                lp_pos,
+                                                Some(lp_bounds),
+                                                Some((&*dict_ref, def_lang)),
+                                            ) {
                                                 r.long_press_anchor_word =
                                                     r.normalized_selection();
                                                 r.long_press_origin_pos = Some(lp_pos);
@@ -2279,6 +2286,9 @@ pub fn render_reader_view(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                        let dict_rc = this.dict_store.clone();
+                        let def_lang = this.dict_def_lang;
+                        let dict_ref = dict_rc.borrow();
                         if let Some(r) = &mut this.reader {
                             if r.show_toc || r.show_notes || r.page_touch_mode.is_some() {
                                 return;
@@ -2286,7 +2296,11 @@ pub fn render_reader_view(
                             r.mouse_down_pos = Some(ev.position);
                             if ev.click_count == 2 {
                                 let b = r.viewport_bounds.get();
-                                if r.select_word_at_point(ev.position, Some(b)) {
+                                if r.select_word_at_point(
+                                    ev.position,
+                                    Some(b),
+                                    Some((&*dict_ref, def_lang)),
+                                ) {
                                     r.is_mouse_selecting = true;
                                     cx.notify();
                                 }
@@ -2458,7 +2472,11 @@ pub fn render_reader_view(
                                                     .bg(hex_color(pal.surface))
                                                     .text_size(px(9.5))
                                                     .text_color(hex_color(pal.accent))
-                                                    .child(entry.source.badge()),
+                                                    .child(format!(
+                                                        "{} · {}",
+                                                        entry.source.badge(),
+                                                        entry.def_lang.short_label()
+                                                    )),
                                             ),
                                     )
                                     .child(

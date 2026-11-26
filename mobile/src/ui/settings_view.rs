@@ -438,66 +438,123 @@ pub fn render_settings_tab(
             )
         });
 
-    let dict_status_text = if app.dict_stats.installed {
-        let mb = app.dict_stats.size_bytes as f64 / (1024.0 * 1024.0);
-        format!(
-            "Installed: {} lemmas · {} inflections ({mb:.1} MB) · {} cached",
-            app.dict_stats.lemma_count, app.dict_stats.form_count, app.dict_stats.cached_count
-        )
-    } else {
-        format!(
-            "Not downloaded yet · online Wiktionary fallback active ({} cached)",
-            app.dict_stats.cached_count
-        )
-    };
+    let active_def_lang = app.dict_def_lang;
+    let dict_downloading = app.dict_downloading;
+    let dict_pack_rows = app.dict_stats_all.iter().map(|(lang, st)| {
+        let lang = *lang;
+        let is_active = lang == active_def_lang;
+        let is_downloading = dict_downloading == Some(lang);
+        let status_txt = if st.installed {
+            let mb = st.size_bytes as f64 / (1024.0 * 1024.0);
+            format!(
+                "{} lemmas · {} forms ({mb:.1} MB) · {} cached",
+                st.lemma_count, st.form_count, st.cached_count
+            )
+        } else {
+            format!(
+                "Online Wiktionary fallback ({} cached)",
+                st.cached_count
+            )
+        };
+        h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .p_2()
+            .rounded(px(8.))
+            .bg(hex_color(kd::BG_DEEP))
+            .border_1()
+            .border_color(hex_color(if is_active {
+                kd::GREEN
+            } else {
+                kd::BORDER_SUBTLE
+            }))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hex_color(kd::FG))
+                            .child(format!("{} definitions", lang.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(hex_color(kd::FG_SUBTLE))
+                            .truncate()
+                            .child(status_txt),
+                    ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("set-dict-dl-{}", lang.code())))
+                    .with_variant(if st.installed {
+                        ButtonVariant::Secondary
+                    } else if is_active {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    })
+                    .xsmall()
+                    .disabled(dict_downloading.is_some())
+                    .label(if is_downloading {
+                        "Downloading…"
+                    } else if st.installed {
+                        "Update"
+                    } else {
+                        "Download"
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.download_offline_dictionary(lang, cx);
+                    })),
+            )
+    });
 
     let dict_card = v_flex()
         .w_full()
         .p_3p5()
-        .gap_2()
+        .gap_2p5()
         .rounded(px(12.))
         .bg(hex_color(kd::BG_SIDEBAR))
         .border_1()
         .border_color(hex_color(kd::BORDER_SUBTLE))
         .child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(hex_color(kd::FG))
-                        .child("Offline Dictionary (EN / RU)"),
-                )
-                .child(
-                    Button::new("set-dict-download")
-                        .with_variant(if app.dict_stats.installed {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Primary
-                        })
-                        .small()
-                        .disabled(app.dict_downloading)
-                        .label(if app.dict_downloading {
-                            "Downloading…"
-                        } else if app.dict_stats.installed {
-                            "Update Pack"
-                        } else {
-                            "Download EN/RU"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.download_offline_dictionary(cx);
-                        })),
-                ),
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(hex_color(kd::FG))
+                .child("Dictionary & Definition Language"),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(hex_color(kd::FG_SUBTLE))
-                .child(dict_status_text),
-        );
+                .child("Look up English, Russian, or Simplified Chinese words and get definitions in your chosen language:"),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_1p5()
+                .children(bookworm_core::dictionary::DictDefLang::all().iter().copied().map(|dl| {
+                    let active = dl == active_def_lang;
+                    Button::new(SharedString::from(format!("set-dict-lang-{}", dl.code())))
+                        .with_variant(if active {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        })
+                        .small()
+                        .flex_1()
+                        .label(dl.label())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_dict_def_lang(dl, cx);
+                        }))
+                })),
+        )
+        .children(dict_pack_rows);
 
     let body = v_flex()
         .w_full()

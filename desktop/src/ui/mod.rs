@@ -172,8 +172,25 @@ impl BookwormApp {
                 LibraryViewEvent::ExportNotes => {
                     app.export_notes_to_markdown(cx);
                 }
-                LibraryViewEvent::DownloadDictionary => {
-                    app.download_offline_dictionary(cx);
+                LibraryViewEvent::SetDictDefLang(lang) => {
+                    let mut store = LibraryStore::load(&app.workspace_root);
+                    store.reader_prefs.dict_def_lang = *lang;
+                    let _ = store.sync_save(&app.workspace_root);
+                    let updated_prefs = store.reader_prefs.clone();
+                    app.sync_library_view_store(store, cx);
+                    for tab in &app.tabs {
+                        if let Some(view) = &tab.view {
+                            view.update(cx, |v, cx| v.apply_prefs(updated_prefs.clone(), cx));
+                        }
+                    }
+                    app.show_toast(
+                        format!("Dictionary definitions: {}", lang.label()),
+                        false,
+                        cx,
+                    );
+                }
+                LibraryViewEvent::DownloadDictionary(lang) => {
+                    app.download_offline_dictionary(*lang, cx);
                 }
                 LibraryViewEvent::StatusToast(msg) => {
                     app.show_toast(msg.clone(), false, cx);
@@ -188,8 +205,8 @@ impl BookwormApp {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("bookworm")
             .join("dictionaries");
-        let _ = bookworm_core::dictionary::DictionaryStore::maybe_import_from(
-            &workspace_root.join("Dictionaries").join("en-ru.db"),
+        let _ = bookworm_core::dictionary::DictionaryStore::maybe_import_from_dir(
+            &workspace_root.join("Dictionaries"),
             &dict_dir,
         );
 
@@ -386,6 +403,7 @@ impl BookwormApp {
                 let mut store = LibraryStore::load(&app.workspace_root);
                 store.reader_prefs = prefs.clone();
                 let _ = store.sync_save(&app.workspace_root);
+                app.sync_library_view_store(store, cx);
                 for tab in &app.tabs {
                     if let Some(other) = &tab.view
                         && other != view
@@ -555,13 +573,17 @@ impl BookwormApp {
         }
     }
 
-    pub fn download_offline_dictionary(&mut self, cx: &mut Context<Self>) {
+    pub fn download_offline_dictionary(
+        &mut self,
+        def_lang: bookworm_core::dictionary::DictDefLang,
+        cx: &mut Context<Self>,
+    ) {
         if self.dict_downloading {
             return;
         }
         self.dict_downloading = true;
         self.show_toast(
-            "Downloading offline EN/RU dictionary pack…".to_string(),
+            format!("Downloading offline {} definitions pack…", def_lang.label()),
             false,
             cx,
         );
@@ -570,10 +592,7 @@ impl BookwormApp {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    bookworm_core::dictionary::download_offline_pack(
-                        &dict_dir,
-                        bookworm_core::dictionary::DEFAULT_DICT_PACK_URL,
-                    )
+                    bookworm_core::dictionary::download_offline_pack_for(&dict_dir, def_lang)
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
@@ -587,8 +606,10 @@ impl BookwormApp {
                         }
                         app.show_toast(
                             format!(
-                                "Offline EN/RU dictionary ready ({} lemmas, {} forms)",
-                                stats.lemma_count, stats.form_count
+                                "Offline {} dictionary ready ({} lemmas, {} forms)",
+                                def_lang.label(),
+                                stats.lemma_count,
+                                stats.form_count
                             ),
                             false,
                             cx,

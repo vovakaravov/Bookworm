@@ -9,16 +9,16 @@ use crate::config::{
 };
 use crate::theme::ReaderTheme;
 use bookworm_core::dictionary::{
-    DEFAULT_DICT_PACK_URL, DictionaryEntry, DictionaryStats, DictionaryStore,
-    download_offline_pack, extract_lookup_word, lookup_online_and_cache,
+    DictDefLang, DictionaryEntry, DictionaryStats, DictionaryStore, download_offline_pack_for,
+    extract_lookup_word, lookup_online_and_cache,
 };
 use bookworm_core::epub::{EpubBlock, EpubBook, GlobalBookLocation, create_sample_epub};
 use bookworm_core::export_md::export_library_notes_to_dir;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookRecord, ChapterPage, HighlightColor, HighlightDecoration,
     LibraryStore, MeasuredBlock, ReaderPaginationPref, ReaderThemePref, ReaderWidthPref,
-    ReadingStatus, clamp_to_char_boundary, page_index_for_block, paginate_measured_blocks,
-    scan_books_cached, word_bounds_at,
+    ReadingStatus, cjk_word_bounds_at, clamp_to_char_boundary, page_index_for_block,
+    paginate_measured_blocks, scan_books_cached, word_bounds_at,
 };
 use bookworm_core::{can_read_dir, count_direct_matching_files, list_subdirectories};
 use gpui::{prelude::*, *};
@@ -554,6 +554,7 @@ impl ReaderState {
         &mut self,
         pos: Point<Pixels>,
         clip_bounds: Option<Bounds<Pixels>>,
+        cjk_dict: Option<(&DictionaryStore, DictDefLang)>,
     ) -> bool {
         let Some(hit) = self.hit_test_strict(pos, clip_bounds) else {
             return false;
@@ -564,7 +565,11 @@ impl ReaderState {
         if txt.is_empty() {
             return false;
         }
-        let r = word_bounds_at(txt, hit.byte_offset);
+        let r = if let Some((store, def_lang)) = cjk_dict {
+            cjk_word_bounds_at(txt, hit.byte_offset, |w| store.has_cjk_word(w, def_lang))
+        } else {
+            word_bounds_at(txt, hit.byte_offset)
+        };
         let (a, b) = if r.start < r.end {
             (r.start, r.end)
         } else {
@@ -691,8 +696,9 @@ pub struct BookwormMobileApp {
     pub status_banner: Option<String>,
     pub dict_dir: PathBuf,
     pub dict_store: Rc<RefCell<DictionaryStore>>,
-    pub dict_stats: DictionaryStats,
-    pub dict_downloading: bool,
+    pub dict_def_lang: DictDefLang,
+    pub dict_stats_all: [(DictDefLang, DictionaryStats); 3],
+    pub dict_downloading: Option<DictDefLang>,
 
     pub library_search_input: Entity<InputState>,
     pub highlight_note_input: Entity<InputState>,
@@ -1061,12 +1067,13 @@ impl BookwormMobileApp {
         });
 
         let dict_dir = app_storage_dir("dictionaries");
-        let _ = DictionaryStore::maybe_import_from(
-            &books_root.join("Dictionaries").join("en-ru.db"),
+        let _ = DictionaryStore::maybe_import_from_dir(
+            &books_root.join("Dictionaries"),
             &dict_dir,
         );
         let dict_store = DictionaryStore::open(dict_dir.clone());
-        let dict_stats = dict_store.stats();
+        let dict_def_lang = library_store.reader_prefs.dict_def_lang;
+        let dict_stats_all = dict_store.all_stats();
         let dict_store = Rc::new(RefCell::new(dict_store));
 
         let mut app = Self {
@@ -1097,8 +1104,9 @@ impl BookwormMobileApp {
             status_banner: initial_banner,
             dict_dir,
             dict_store,
-            dict_stats,
-            dict_downloading: false,
+            dict_def_lang,
+            dict_stats_all,
+            dict_downloading: None,
             library_search_input,
             highlight_note_input,
             folder_picker_input,
@@ -2583,8 +2591,26 @@ impl BookwormMobileApp {
         cx.notify();
     }
 
+    pub fn set_dict_def_lang(&mut self, lang: DictDefLang, cx: &mut Context<Self>) {
+        if self.dict_def_lang == lang {
+            return;
+        }
+        self.dict_def_lang = lang;
+        self.library_store.reader_prefs.dict_def_lang = lang;
+        self.schedule_library_sync_save(false, cx);
+        if let Some(q) = self
+            .reader
+            .as_ref()
+            .and_then(|r| r.draft.as_ref().map(|d| d.quote.clone()))
+        {
+            self.trigger_reader_dict_lookup(&q, cx);
+        }
+        cx.notify();
+    }
+
     pub fn trigger_reader_dict_lookup(&mut self, query: &str, cx: &mut Context<Self>) {
         let clean = extract_lookup_word(query);
+        let def_lang = self.dict_def_lang;
         let Some(r) = &mut self.reader else {
             return;
         };
@@ -2596,7 +2622,7 @@ impl BookwormMobileApp {
             return;
         };
 
-        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term) {
+        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term, def_lang) {
             r.dict_lookup = Some(DictLookupState::Found(hits));
             return;
         }
@@ -2605,18 +2631,27 @@ impl BookwormMobileApp {
         let dict_dir = self.dict_dir.clone();
         let raw_trimmed = query.trim().to_string();
         cx.spawn(async move |this, cx| {
+            let term_fallback = term.clone();
             let res = cx
                 .background_executor()
-                .spawn(async move { lookup_online_and_cache(&term, &dict_dir) })
+                .spawn(async move { lookup_online_and_cache(&term, def_lang, &dict_dir) })
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.dict_store.borrow_mut().reload();
-                app.dict_stats = app.dict_store.borrow().stats();
+                app.dict_stats_all = app.dict_store.borrow().all_stats();
+                let resolved = match res {
+                    Some(entries) if !entries.is_empty() => Some(entries),
+                    _ if def_lang != DictDefLang::En => app
+                        .dict_store
+                        .borrow_mut()
+                        .lookup_offline_fallback_en(&term_fallback),
+                    _ => None,
+                };
                 if let Some(r) = &mut app.reader
                     && r.book_rel == book_rel
                     && r.dict_lookup_gen == lookup_seq
                 {
-                    r.dict_lookup = Some(match res {
+                    r.dict_lookup = Some(match resolved {
                         Some(entries) if !entries.is_empty() => DictLookupState::Found(entries),
                         _ => DictLookupState::NotFound(raw_trimmed),
                     });
@@ -2647,28 +2682,33 @@ impl BookwormMobileApp {
         self.reader_save_highlight_draft(window, cx);
     }
 
-    pub fn download_offline_dictionary(&mut self, cx: &mut Context<Self>) {
-        if self.dict_downloading {
+    pub fn download_offline_dictionary(&mut self, def_lang: DictDefLang, cx: &mut Context<Self>) {
+        if self.dict_downloading.is_some() {
             return;
         }
-        self.dict_downloading = true;
-        self.status_banner = Some("Downloading offline EN/RU dictionary pack…".to_string());
+        self.dict_downloading = Some(def_lang);
+        self.status_banner = Some(format!(
+            "Downloading offline {} definitions pack…",
+            def_lang.label()
+        ));
         cx.notify();
         let dict_dir = self.dict_dir.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { download_offline_pack(&dict_dir, DEFAULT_DICT_PACK_URL) })
+                .spawn(async move { download_offline_pack_for(&dict_dir, def_lang) })
                 .await;
             let _ = this.update(cx, |app, cx| {
-                app.dict_downloading = false;
+                app.dict_downloading = None;
                 match res {
                     Ok(stats) => {
                         app.dict_store.borrow_mut().reload();
-                        app.dict_stats = stats.clone();
+                        app.dict_stats_all = app.dict_store.borrow().all_stats();
                         app.status_banner = Some(format!(
-                            "Offline EN/RU dictionary ready ({} lemmas, {} forms)",
-                            stats.lemma_count, stats.form_count
+                            "Offline {} dictionary ready ({} lemmas, {} forms)",
+                            def_lang.label(),
+                            stats.lemma_count,
+                            stats.form_count
                         ));
                     }
                     Err(err) => {

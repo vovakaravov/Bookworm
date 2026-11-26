@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Build Bookworm's compressed offline EN/RU SQLite dictionary pack from Kaikki Wiktionary dumps."""
+"""Build Bookworm's compressed offline EN / RU / ZH-Hans SQLite dictionary packs from Kaikki dumps."""
 
+import argparse
 import gzip
 import json
-import os
 import shutil
 import sqlite3
 import sys
 import urllib.request
 from pathlib import Path
 
-BUILD_DIR = Path("/tmp/bookworm-dict-build")
-RU_URL = "https://kaikki.org/dictionary/Russian/kaikki.org-dictionary-Russian.jsonl.gz"
-EN_URL = "https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl.gz"
+try:
+    from opencc import OpenCC  # type: ignore
 
-OUT_DB = BUILD_DIR / "bookworm-dict-en-ru.db"
-OUT_GZ = BUILD_DIR / "bookworm-dict-en-ru.db.gz"
+    T2S = OpenCC("t2s")
+except Exception:
+    T2S = None
+
+BUILD_DIR = Path("/tmp/bookworm-dict-build")
+
+EN_PACK_SOURCES = [
+    ("ru", "https://kaikki.org/dictionary/Russian/kaikki.org-dictionary-Russian.jsonl.gz", "kaikki-ru.jsonl.gz"),
+    ("en", "https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl.gz", "kaikki-en.jsonl.gz"),
+    ("zh", "https://kaikki.org/dictionary/Chinese/kaikki.org-dictionary-Chinese.jsonl.gz", "kaikki-zh.jsonl.gz"),
+]
+RU_WIKT_URL = "https://kaikki.org/ruwiktionary/raw-wiktextract-data.jsonl.gz"
+ZH_WIKT_URL = "https://kaikki.org/zhwiktionary/raw-wiktextract-data.jsonl.gz"
 
 SKIP_FORM_TAGS = {
     "table-tags",
@@ -27,9 +37,25 @@ SKIP_FORM_TAGS = {
     "archaic",
 }
 
+TARGET_LANGS = {"en", "ru", "zh"}
+
+
+def to_simplified(text: str) -> str:
+    if not text or T2S is None:
+        return text
+    return T2S.convert(text)
+
+
+def is_cjk_char(ch: str) -> bool:
+    o = ord(ch)
+    return (0x3400 <= o <= 0x4DBF) or (0x4E00 <= o <= 0x9FFF) or (0xF900 <= o <= 0xFAFF)
+
 
 def norm_key(word: str, lang: str) -> str:
-    w = word.strip().replace("\u0301", "").lower()
+    w = word.strip().replace("\u0301", "")
+    if lang == "zh":
+        return "".join(ch for ch in w if not ch.isspace())
+    w = w.lower()
     if lang == "ru":
         w = w.replace("ё", "е")
     return w
@@ -41,14 +67,20 @@ def download_if_missing(url: str, dest: Path) -> None:
         return
     tmp = dest.with_suffix(".tmp")
     print(f"Downloading {url} -> {dest} ...")
-    req = urllib.request.Request(url, headers={"User-Agent": "Bookworm-Dict-Builder/1.0"})
-    with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as f:
+    req = urllib.request.Request(url, headers={"User-Agent": "Bookworm-Dict-Builder/2.0"})
+    with urllib.request.urlopen(req, timeout=300) as resp, open(tmp, "wb") as f:
         shutil.copyfileobj(resp, f, length=1024 * 1024)
     tmp.replace(dest)
     print(f"Downloaded {dest.stat().st_size / 1e6:.1f} MB")
 
 
-def extract_ipa(obj: dict) -> str:
+def extract_ipa(obj: dict, lang: str) -> str:
+    if lang == "zh":
+        for snd in obj.get("sounds") or []:
+            tags = set(snd.get("tags") or [])
+            zp = snd.get("zh_pron")
+            if isinstance(zp, str) and zp.strip() and ("Pinyin" in tags or "Standard-Chinese" in tags):
+                return zp.strip()
     for snd in obj.get("sounds") or []:
         ipa = snd.get("ipa")
         if isinstance(ipa, str) and ipa.strip():
@@ -56,7 +88,7 @@ def extract_ipa(obj: dict) -> str:
     return ""
 
 
-def extract_ru_stressed(obj: dict, headword: str) -> str:
+def extract_ru_stressed(obj: dict) -> str:
     for f in obj.get("forms") or []:
         tags = set(f.get("tags") or [])
         if "canonical" in tags:
@@ -66,18 +98,23 @@ def extract_ru_stressed(obj: dict, headword: str) -> str:
     return ""
 
 
-def extract_glosses(obj: dict) -> list[str]:
+def extract_glosses(obj: dict, convert_simplified: bool = False) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for sense in obj.get("senses") or []:
         if len(out) >= 4:
             break
+        tags = set(sense.get("tags") or [])
+        if "no-gloss" in tags:
+            continue
         raw_glosses = sense.get("glosses") or []
         if not raw_glosses:
             continue
         g = " — ".join(str(x).strip() for x in raw_glosses if str(x).strip())
         if not g:
             continue
+        if convert_simplified:
+            g = to_simplified(g)
         if len(g) > 180:
             g = g[:177].rstrip() + "..."
         low = g.lower()
@@ -113,124 +150,21 @@ def extract_ru_translations(obj: dict) -> str | None:
     return ", ".join(trs) if trs else None
 
 
-def is_clean_headword(word: str) -> bool:
-    if not word or len(word) > 48:
+def is_clean_headword(word: str, lang: str) -> bool:
+    if not word:
         return False
-    if len(word.split()) > 2:
+    if lang == "zh":
+        compact = "".join(ch for ch in word if not ch.isspace())
+        return 1 <= len(compact) <= 8 and any(is_cjk_char(ch) for ch in compact)
+    if len(word) > 48 or len(word.split()) > 2:
         return False
     return any(ch.isalpha() for ch in word)
 
 
-def ingest_dump(conn: sqlite3.Connection, gz_path: Path, lang: str) -> tuple[int, int]:
-    cur = conn.cursor()
-    lemma_rows = []
-    form_rows = []
-    next_id_row = cur.execute("SELECT COALESCE(MAX(id), 0) FROM lemmas").fetchone()
-    lemma_id = int(next_id_row[0])
-
-    total_lemmas = 0
-    total_forms = 0
-    seen_forms: set[tuple[str, int]] = set()
-
-    with gzip.open(gz_path, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            word = (obj.get("word") or "").strip()
-            if not is_clean_headword(word):
-                continue
-            glosses = extract_glosses(obj)
-            if not glosses:
-                continue
-            key = norm_key(word, lang)
-            if not key:
-                continue
-
-            lemma_id += 1
-            pos = (obj.get("pos") or "").strip().lower()
-            ipa = extract_ipa(obj)
-            stressed = extract_ru_stressed(obj, word) if lang == "ru" else ""
-            ru_tr = extract_ru_translations(obj) if lang == "en" else None
-
-            lemma_rows.append(
-                (
-                    lemma_id,
-                    lang,
-                    key,
-                    stressed,
-                    ipa,
-                    pos,
-                    json.dumps(glosses, ensure_ascii=False),
-                    ru_tr,
-                )
-            )
-            total_lemmas += 1
-
-            for f in obj.get("forms") or []:
-                raw_form = (f.get("form") or "").strip()
-                if not raw_form or len(raw_form) > 56 or len(raw_form.split()) > 2:
-                    continue
-                tags = [str(t) for t in (f.get("tags") or [])]
-                if not tags or any(t in SKIP_FORM_TAGS for t in tags):
-                    continue
-                if any(ord(c) < 0x0400 for c in raw_form) and lang == "ru":
-                    # Skip transliterations stored in forms for Russian
-                    if not any(0x0400 <= ord(c) <= 0x04FF for c in raw_form):
-                        continue
-                fkey = norm_key(raw_form, lang)
-                if not fkey or fkey == key:
-                    continue
-                pair = (fkey, lemma_id)
-                if pair in seen_forms:
-                    continue
-                seen_forms.add(pair)
-                gram = ", ".join(tags[:3])
-                form_rows.append((fkey, lang, lemma_id, gram))
-                total_forms += 1
-
-            if len(lemma_rows) >= 25_000:
-                cur.executemany(
-                    "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    lemma_rows,
-                )
-                cur.executemany(
-                    "INSERT OR IGNORE INTO forms (form, lang, lemma_id, gram) VALUES (?, ?, ?, ?)",
-                    form_rows,
-                )
-                lemma_rows.clear()
-                form_rows.clear()
-                seen_forms.clear()
-
-    if lemma_rows:
-        cur.executemany(
-            "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            lemma_rows,
-        )
-    if form_rows:
-        cur.executemany(
-            "INSERT OR IGNORE INTO forms (form, lang, lemma_id, gram) VALUES (?, ?, ?, ?)",
-            form_rows,
-        )
-    conn.commit()
-    return total_lemmas, total_forms
-
-
-def main() -> int:
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    ru_gz = BUILD_DIR / "kaikki-ru.jsonl.gz"
-    en_gz = BUILD_DIR / "kaikki-en.jsonl.gz"
-
-    download_if_missing(RU_URL, ru_gz)
-    download_if_missing(EN_URL, en_gz)
-
-    if OUT_DB.exists():
-        OUT_DB.unlink()
-
-    conn = sqlite3.connect(OUT_DB)
+def init_db(db_path: Path) -> sqlite3.Connection:
+    if db_path.exists():
+        db_path.unlink()
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = OFF;")
     conn.execute("PRAGMA synchronous = OFF;")
     conn.execute("PRAGMA temp_store = MEMORY;")
@@ -256,22 +190,190 @@ def main() -> int:
         ) WITHOUT ROWID;
         """
     )
+    return conn
 
-    ru_l, ru_f = ingest_dump(conn, ru_gz, "ru")
-    print(f"Russian ingested: {ru_l:,} lemmas, {ru_f:,} forms")
-    en_l, en_f = ingest_dump(conn, en_gz, "en")
-    print(f"English ingested: {en_l:,} lemmas, {en_f:,} forms")
 
-    print("Creating index and vacuuming...")
+def flush_batches(cur: sqlite3.Cursor, lemma_rows: list, form_rows: list) -> None:
+    if lemma_rows:
+        cur.executemany(
+            "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            lemma_rows,
+        )
+        lemma_rows.clear()
+    if form_rows:
+        cur.executemany(
+            "INSERT OR IGNORE INTO forms (form, lang, lemma_id, gram) VALUES (?, ?, ?, ?)",
+            form_rows,
+        )
+        form_rows.clear()
+
+
+def ingest_dump(
+    conn: sqlite3.Connection,
+    gz_path: Path,
+    fixed_lang: str | None,
+    convert_zh_glosses: bool = False,
+) -> tuple[int, int]:
+    cur = conn.cursor()
+    lemma_rows = []
+    form_rows = []
+    next_id_row = cur.execute("SELECT COALESCE(MAX(id), 0) FROM lemmas").fetchone()
+    lemma_id = int(next_id_row[0])
+
+    total_lemmas = 0
+    total_forms = 0
+    seen_forms: set[tuple[str, str, int]] = set()
+
+    with gzip.open(gz_path, "rt", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            lang = fixed_lang or (obj.get("lang_code") or "").strip().lower()
+            if lang not in TARGET_LANGS:
+                continue
+
+            word = (obj.get("word") or "").strip()
+            if not is_clean_headword(word, lang):
+                continue
+
+            glosses = extract_glosses(obj, convert_simplified=convert_zh_glosses)
+            if not glosses:
+                continue
+
+            orig_key = norm_key(word, lang)
+            if not orig_key:
+                continue
+            key = norm_key(to_simplified(orig_key), "zh") if lang == "zh" else orig_key
+            if not key:
+                continue
+
+            lemma_id += 1
+            pos = (obj.get("pos") or "").strip().lower()
+            ipa = extract_ipa(obj, lang)
+            stressed = extract_ru_stressed(obj) if lang == "ru" else ""
+            ru_tr = extract_ru_translations(obj) if (lang == "en" and fixed_lang == "en") else None
+
+            lemma_rows.append(
+                (
+                    lemma_id,
+                    lang,
+                    key,
+                    stressed,
+                    ipa,
+                    pos,
+                    json.dumps(glosses, ensure_ascii=False),
+                    ru_tr,
+                )
+            )
+            total_lemmas += 1
+
+            # Map Traditional / alternate Chinese script form -> Simplified lemma
+            if lang == "zh" and orig_key != key:
+                pair = (orig_key, "zh", lemma_id)
+                seen_forms.add(pair)
+                form_rows.append((orig_key, "zh", lemma_id, "Traditional"))
+                total_forms += 1
+
+            for f in obj.get("forms") or []:
+                raw_form = (f.get("form") or "").strip()
+                if not raw_form or len(raw_form) > 56 or len(raw_form.split()) > 2:
+                    continue
+                tags = [str(t) for t in (f.get("tags") or [])]
+                if not tags or any(t in SKIP_FORM_TAGS for t in tags):
+                    continue
+                if lang == "ru" and any(ord(c) < 0x0400 for c in raw_form):
+                    if not any(0x0400 <= ord(c) <= 0x04FF for c in raw_form):
+                        continue
+                if lang == "zh" and not any(is_cjk_char(c) for c in raw_form):
+                    continue
+                fkey = norm_key(raw_form, lang)
+                if not fkey or fkey == key:
+                    continue
+                pair = (fkey, lang, lemma_id)
+                if pair in seen_forms:
+                    continue
+                seen_forms.add(pair)
+                gram = ", ".join(tags[:3])
+                form_rows.append((fkey, lang, lemma_id, gram))
+                total_forms += 1
+
+            if len(lemma_rows) >= 25_000:
+                flush_batches(cur, lemma_rows, form_rows)
+                seen_forms.clear()
+
+    flush_batches(cur, lemma_rows, form_rows)
+    conn.commit()
+    return total_lemmas, total_forms
+
+
+def finalize_and_compress(conn: sqlite3.Connection, db_path: Path, gz_path: Path) -> None:
+    print(f"Creating index for {db_path.name}...")
     conn.execute("CREATE INDEX idx_lemmas_lang_word ON lemmas(lang, word);")
     conn.execute("ANALYZE;")
     conn.commit()
     conn.close()
 
-    print(f"Compressing {OUT_DB} ({OUT_DB.stat().st_size / 1e6:.1f} MB) -> {OUT_GZ} ...")
-    with open(OUT_DB, "rb") as src, gzip.open(OUT_GZ, "wb", compresslevel=6) as dst:
+    print(f"Compressing {db_path} ({db_path.stat().st_size / 1e6:.1f} MB) -> {gz_path} ...")
+    with open(db_path, "rb") as src, gzip.open(gz_path, "wb", compresslevel=6) as dst:
         shutil.copyfileobj(src, dst, length=1024 * 1024)
-    print(f"Done: db={OUT_DB.stat().st_size / 1e6:.1f} MB, gz={OUT_GZ.stat().st_size / 1e6:.1f} MB")
+    print(f"Done: db={db_path.stat().st_size / 1e6:.1f} MB, gz={gz_path.stat().st_size / 1e6:.1f} MB")
+
+
+def build_pack_en() -> None:
+    out_db = BUILD_DIR / "bookworm-dict-def-en.db"
+    out_gz = BUILD_DIR / "bookworm-dict-def-en.db.gz"
+    conn = init_db(out_db)
+    for lang, url, fname in EN_PACK_SOURCES:
+        src = BUILD_DIR / fname
+        download_if_missing(url, src)
+        l, f = ingest_dump(conn, src, fixed_lang=lang, convert_zh_glosses=False)
+        print(f"[def-en] {lang}: {l:,} lemmas, {f:,} forms")
+    finalize_and_compress(conn, out_db, out_gz)
+
+
+def build_pack_ru() -> None:
+    out_db = BUILD_DIR / "bookworm-dict-def-ru.db"
+    out_gz = BUILD_DIR / "bookworm-dict-def-ru.db.gz"
+    src = BUILD_DIR / "kaikki-ruwikt-raw.jsonl.gz"
+    download_if_missing(RU_WIKT_URL, src)
+    conn = init_db(out_db)
+    l, f = ingest_dump(conn, src, fixed_lang=None, convert_zh_glosses=False)
+    print(f"[def-ru] total (en/ru/zh): {l:,} lemmas, {f:,} forms")
+    finalize_and_compress(conn, out_db, out_gz)
+
+
+def build_pack_zh() -> None:
+    out_db = BUILD_DIR / "bookworm-dict-def-zh.db"
+    out_gz = BUILD_DIR / "bookworm-dict-def-zh.db.gz"
+    src = BUILD_DIR / "kaikki-zhwikt-raw.jsonl.gz"
+    download_if_missing(ZH_WIKT_URL, src)
+    conn = init_db(out_db)
+    l, f = ingest_dump(conn, src, fixed_lang=None, convert_zh_glosses=True)
+    print(f"[def-zh] total (en/ru/zh Simplified): {l:,} lemmas, {f:,} forms")
+    finalize_and_compress(conn, out_db, out_gz)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build Bookworm offline dictionary packs.")
+    parser.add_argument(
+        "--pack",
+        choices=["en", "ru", "zh", "all"],
+        default="all",
+        help="Which definition-language pack to build",
+    )
+    args = parser.parse_args()
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    if args.pack in ("en", "all"):
+        build_pack_en()
+    if args.pack in ("ru", "all"):
+        build_pack_ru()
+    if args.pack in ("zh", "all"):
+        build_pack_zh()
     return 0
 
 

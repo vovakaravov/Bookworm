@@ -2,15 +2,15 @@ use super::find_bar::{FIND_INPUT_W, find_count_badge, floating_find_card};
 use super::image_util::decode_bytes_image;
 use super::{BookTab, BookwormApp};
 use bookworm_core::dictionary::{
-    DictionaryEntry, DictionaryStore, extract_lookup_word, lookup_online_and_cache,
+    DictDefLang, DictionaryEntry, DictionaryStore, extract_lookup_word, lookup_online_and_cache,
 };
 use bookworm_core::epub::{EpubBlock, EpubBook, EpubRun, GlobalBookLocation, OutlineEntry};
 use bookworm_core::find_all_byte_ranges;
 use bookworm_core::library::{
     BookBookmark, BookHighlight, BookUserState, ChapterPage, HighlightColor, HighlightDecoration,
     MeasuredBlock, PageSlice, ReaderFontPref, ReaderPaginationPref, ReaderPrefs, ReaderThemePref,
-    ReaderWidthPref, ReadingStatus, clamp_to_char_boundary, page_index_for_block,
-    paginate_measured_blocks, word_bounds_at,
+    ReaderWidthPref, ReadingStatus, cjk_word_bounds_at, clamp_to_char_boundary,
+    page_index_for_block, paginate_measured_blocks,
 };
 use crate::theme::{hex_alpha, hex_color, kd};
 use std::collections::HashMap;
@@ -1001,12 +1001,13 @@ impl EpubView {
     fn trigger_dict_lookup(&mut self, query: &str, cx: &mut Context<Self>) {
         self.dict_lookup_gen = self.dict_lookup_gen.wrapping_add(1);
         let lookup_seq = self.dict_lookup_gen;
+        let def_lang = self.prefs.dict_def_lang;
         let Some(term) = extract_lookup_word(query) else {
             self.dict_lookup = None;
             return;
         };
 
-        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term) {
+        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term, def_lang) {
             self.dict_lookup = Some(DictLookupState::Found(hits));
             return;
         }
@@ -1015,14 +1016,23 @@ impl EpubView {
         let dict_dir = self.dict_dir.clone();
         let raw_trimmed = query.trim().to_string();
         cx.spawn(async move |this, cx| {
+            let term_fallback = term.clone();
             let res = cx
                 .background_executor()
-                .spawn(async move { lookup_online_and_cache(&term, &dict_dir) })
+                .spawn(async move { lookup_online_and_cache(&term, def_lang, &dict_dir) })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.dict_lookup_gen == lookup_seq {
                     view.dict_store.borrow_mut().reload();
-                    view.dict_lookup = Some(match res {
+                    let resolved = match res {
+                        Some(entries) if !entries.is_empty() => Some(entries),
+                        _ if def_lang != DictDefLang::En => view
+                            .dict_store
+                            .borrow_mut()
+                            .lookup_offline_fallback_en(&term_fallback),
+                        _ => None,
+                    };
+                    view.dict_lookup = Some(match resolved {
                         Some(entries) if !entries.is_empty() => DictLookupState::Found(entries),
                         _ => DictLookupState::NotFound(raw_trimmed),
                     });
@@ -1374,6 +1384,20 @@ impl EpubView {
 
     pub fn cycle_theme(&mut self, cx: &mut Context<Self>) {
         self.prefs.theme = self.prefs.theme.next();
+        self.emit_prefs(cx);
+        cx.notify();
+    }
+
+    pub fn cycle_dict_def_lang(&mut self, cx: &mut Context<Self>) {
+        self.prefs.dict_def_lang = match self.prefs.dict_def_lang {
+            DictDefLang::En => DictDefLang::Ru,
+            DictDefLang::Ru => DictDefLang::ZhHans,
+            DictDefLang::ZhHans => DictDefLang::En,
+        };
+        if let Some((start, end)) = self.normalized_selection() {
+            let quote = self.extract_text_for_range(start, end);
+            self.trigger_dict_lookup(&quote, cx);
+        }
         self.emit_prefs(cx);
         cx.notify();
     }
@@ -2053,7 +2077,11 @@ impl EpubView {
                                                             .bg(panel_bg)
                                                             .text_size(px(10.))
                                                             .text_color(hex_color(kd::ACCENT))
-                                                            .child(entry.source.badge()),
+                                                            .child(format!(
+                                                                "{} · {}",
+                                                                entry.source.badge(),
+                                                                entry.def_lang.short_label()
+                                                            )),
                                                     ),
                                             )
                                             .child(
@@ -3907,10 +3935,17 @@ impl Render for EpubView {
                                         return;
                                     }
                                     if ev.click_count == 2 {
+                                        let def_lang = this.prefs.dict_def_lang;
+                                        let dict_rc = this.dict_store.clone();
+                                        let dict_ref = dict_rc.borrow();
                                         if let Some(txt) =
                                             this.current_chapter_block_text(hit.block_idx)
                                         {
-                                            let r = word_bounds_at(txt, hit.byte_offset);
+                                            let r = cjk_word_bounds_at(
+                                                txt,
+                                                hit.byte_offset,
+                                                |w| dict_ref.has_cjk_word(w, def_lang),
+                                            );
                                             if r.start < r.end {
                                                 let word_str = txt[r.start..r.end].to_string();
                                                 let start = TextPos {
@@ -4138,6 +4173,7 @@ pub fn render_epub_tab(
     let font_label = ev.prefs.font.label();
     let width_label = ev.prefs.width.label();
     let spacing_label = ev.prefs.spacing.label();
+    let dict_lang_label = ev.prefs.dict_def_lang.short_label();
     let ann_count = ev.highlights.len() + ev.bookmarks.len();
     let bm_open = ev.bookmarks_open;
     let cur_ch = ev.chapter_idx;
@@ -4154,6 +4190,7 @@ pub fn render_epub_tab(
     let v_width = view.clone();
     let v_spacing = view.clone();
     let v_thm = view.clone();
+    let v_dict_lang = view.clone();
     let v_bm = view.clone();
     let v_lib = view.clone();
 
@@ -4291,6 +4328,16 @@ pub fn render_epub_tab(
                         .tooltip("Cycle Reader Theme (Dark / Sepia / Paper / AMOLED)")
                         .on_click(cx.listener(move |_, _, _, cx| {
                             v_thm.update(cx, |v, cx| v.cycle_theme(cx));
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("epub-dict-lang-{tab_id}")))
+                        .ghost()
+                        .xsmall()
+                        .label(format!("Def: {dict_lang_label}"))
+                        .tooltip("Cycle Dictionary Definition Language (English / Русский / 中文)")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            v_dict_lang.update(cx, |v, cx| v.cycle_dict_def_lang(cx));
                         })),
                 )
                 .child(
