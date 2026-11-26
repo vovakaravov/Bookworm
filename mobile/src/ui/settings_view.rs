@@ -6,7 +6,7 @@ use gpui::{prelude::*, *};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::scroll::Scrollbar;
-use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::path::{Path, PathBuf};
 
 fn set_icon(name: IconName, sz: f32, color: u32) -> impl IntoElement {
@@ -438,6 +438,67 @@ pub fn render_settings_tab(
             )
         });
 
+    let dict_status_text = if app.dict_stats.installed {
+        let mb = app.dict_stats.size_bytes as f64 / (1024.0 * 1024.0);
+        format!(
+            "Installed: {} lemmas · {} inflections ({mb:.1} MB) · {} cached",
+            app.dict_stats.lemma_count, app.dict_stats.form_count, app.dict_stats.cached_count
+        )
+    } else {
+        format!(
+            "Not downloaded yet · online Wiktionary fallback active ({} cached)",
+            app.dict_stats.cached_count
+        )
+    };
+
+    let dict_card = v_flex()
+        .w_full()
+        .p_3p5()
+        .gap_2()
+        .rounded(px(12.))
+        .bg(hex_color(kd::BG_SIDEBAR))
+        .border_1()
+        .border_color(hex_color(kd::BORDER_SUBTLE))
+        .child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hex_color(kd::FG))
+                        .child("Offline Dictionary (EN / RU)"),
+                )
+                .child(
+                    Button::new("set-dict-download")
+                        .with_variant(if app.dict_stats.installed {
+                            ButtonVariant::Secondary
+                        } else {
+                            ButtonVariant::Primary
+                        })
+                        .small()
+                        .disabled(app.dict_downloading)
+                        .label(if app.dict_downloading {
+                            "Downloading…"
+                        } else if app.dict_stats.installed {
+                            "Update Pack"
+                        } else {
+                            "Download EN/RU"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.download_offline_dictionary(cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(hex_color(kd::FG_SUBTLE))
+                .child(dict_status_text),
+        );
+
     let body = v_flex()
         .w_full()
         .p_3p5()
@@ -446,6 +507,7 @@ pub fn render_settings_tab(
         .child(books_card)
         .child(library_card)
         .child(export_card)
+        .child(dict_card)
         .child(reader_card)
         .child(storage_card);
 

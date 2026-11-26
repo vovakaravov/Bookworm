@@ -8,6 +8,10 @@ use crate::config::{
     books_root_candidates, default_books_root, has_external_storage_access, state_root_for,
 };
 use crate::theme::ReaderTheme;
+use bookworm_core::dictionary::{
+    DEFAULT_DICT_PACK_URL, DictionaryEntry, DictionaryStats, DictionaryStore,
+    download_offline_pack, extract_lookup_word, lookup_online_and_cache,
+};
 use bookworm_core::epub::{EpubBlock, EpubBook, GlobalBookLocation, create_sample_epub};
 use bookworm_core::export_md::export_library_notes_to_dir;
 use bookworm_core::library::{
@@ -132,6 +136,13 @@ pub fn block_plain_text(blk: &EpubBlock) -> Option<&str> {
 }
 
 #[derive(Debug, Clone)]
+pub enum DictLookupState {
+    Loading(String),
+    Found(Vec<DictionaryEntry>),
+    NotFound(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct HighlightEditorDraft {
     pub start_block: usize,
     pub start_offset: usize,
@@ -145,6 +156,11 @@ pub struct HighlightEditorDraft {
 
 pub type ReaderLayoutKey = (u32, u32, u32, u8, bool);
 pub type SliceRenderKey = (usize, usize, usize, usize, bool, u64);
+pub type SliceRenderValue = (
+    SharedString,
+    Vec<(Range<usize>, HighlightStyle)>,
+    Vec<(HighlightDecoration, Range<usize>, u32)>,
+);
 
 pub struct PendingChapterPagination {
     pub ch_idx: usize,
@@ -172,6 +188,8 @@ pub struct ReaderState {
     pub notes_color_filter: Option<HighlightColor>,
     pub notes_only_filter: bool,
     pub draft: Option<HighlightEditorDraft>,
+    pub dict_lookup: Option<DictLookupState>,
+    pub dict_lookup_gen: u64,
     pub draft_sheet_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     pub settings_strip_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     pub viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -206,8 +224,7 @@ pub struct ReaderState {
     /// `(block_idx, byte_base, slice_len, TextLayout)` for currently interactive page/viewport.
     pub rendered_layouts: Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>,
     pub highlights_epoch: u64,
-    pub slice_render_cache:
-        RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
+    pub slice_render_cache: RefCell<HashMap<SliceRenderKey, SliceRenderValue>>,
     pub decoded_images: RefCell<HashMap<(usize, usize), Arc<Image>>>,
     pub pending_scroll_block: Option<(usize, usize)>,
     pub pending_scroll_fraction: Option<f32>,
@@ -258,6 +275,8 @@ impl ReaderState {
         self.mouse_down_pos = None;
         self.is_mouse_selecting = false;
         self.draft = None;
+        self.dict_lookup = None;
+        self.dict_lookup_gen = self.dict_lookup_gen.wrapping_add(1);
     }
 
     pub fn plain_text(&self, blk_ix: usize) -> Option<&str> {
@@ -613,6 +632,10 @@ pub struct BookwormMobileApp {
     pub two_column_spread: bool,
     pub library_grid_size: LibraryGridSize,
     pub status_banner: Option<String>,
+    pub dict_dir: PathBuf,
+    pub dict_store: Rc<RefCell<DictionaryStore>>,
+    pub dict_stats: DictionaryStats,
+    pub dict_downloading: bool,
 
     pub library_search_input: Entity<InputState>,
     pub highlight_note_input: Entity<InputState>,
@@ -948,6 +971,15 @@ impl BookwormMobileApp {
             format!("Merged {initial_conflicts} synced library conflict(s)")
         });
 
+        let dict_dir = app_storage_dir("dictionaries");
+        let _ = DictionaryStore::maybe_import_from(
+            &books_root.join("Dictionaries").join("en-ru.db"),
+            &dict_dir,
+        );
+        let dict_store = DictionaryStore::open(dict_dir.clone());
+        let dict_stats = dict_store.stats();
+        let dict_store = Rc::new(RefCell::new(dict_store));
+
         let mut app = Self {
             image_cache,
             surface: AppSurface::Library,
@@ -974,6 +1006,10 @@ impl BookwormMobileApp {
             two_column_spread: cfg.two_column_spread,
             library_grid_size: cfg.library_grid_size,
             status_banner: initial_banner,
+            dict_dir,
+            dict_store,
+            dict_stats,
+            dict_downloading: false,
             library_search_input,
             highlight_note_input,
             folder_picker_input,
@@ -2235,6 +2271,8 @@ impl BookwormMobileApp {
                     notes_color_filter: None,
                     notes_only_filter: false,
                     draft: None,
+                    dict_lookup: None,
+                    dict_lookup_gen: 0,
                     draft_sheet_bounds: Rc::new(RefCell::new(None)),
                     settings_strip_bounds: Rc::new(RefCell::new(None)),
                     viewport_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -2404,6 +2442,7 @@ impl BookwormMobileApp {
                 style: hl.style,
             });
         }
+        self.trigger_reader_dict_lookup(&hl.quote, cx);
         cx.notify();
     }
 
@@ -2414,13 +2453,13 @@ impl BookwormMobileApp {
     ) {
         let last_color = self.library_store.reader_prefs.last_highlight_color;
         let last_style = self.library_store.reader_prefs.last_highlight_style;
-        let has_sel = if let Some(r) = &mut self.reader {
+        let quote_for_lookup = if let Some(r) = &mut self.reader {
             r.sync_draft_from_selection(last_color, last_style);
-            r.draft.is_some()
+            r.draft.as_ref().map(|d| d.quote.clone())
         } else {
-            false
+            None
         };
-        if has_sel {
+        if let Some(quote) = quote_for_lookup {
             let note_val = self
                 .reader
                 .as_ref()
@@ -2439,8 +2478,108 @@ impl BookwormMobileApp {
                 .unwrap_or_default();
             self.highlight_note_input
                 .update(cx, |inp, cx| inp.set_value(note_val, window, cx));
+            self.trigger_reader_dict_lookup(&quote, cx);
         }
         cx.notify();
+    }
+
+    pub fn trigger_reader_dict_lookup(&mut self, query: &str, cx: &mut Context<Self>) {
+        let clean = extract_lookup_word(query);
+        let Some(r) = &mut self.reader else {
+            return;
+        };
+        r.dict_lookup_gen = r.dict_lookup_gen.wrapping_add(1);
+        let lookup_seq = r.dict_lookup_gen;
+        let book_rel = r.book_rel.clone();
+        let Some(term) = clean else {
+            r.dict_lookup = None;
+            return;
+        };
+
+        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term) {
+            r.dict_lookup = Some(DictLookupState::Found(hits));
+            return;
+        }
+
+        r.dict_lookup = Some(DictLookupState::Loading(term.clone()));
+        let dict_dir = self.dict_dir.clone();
+        let raw_trimmed = query.trim().to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { lookup_online_and_cache(&term, &dict_dir) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.dict_store.borrow_mut().reload();
+                app.dict_stats = app.dict_store.borrow().stats();
+                if let Some(r) = &mut app.reader
+                    && r.book_rel == book_rel
+                    && r.dict_lookup_gen == lookup_seq
+                {
+                    r.dict_lookup = Some(match res {
+                        Some(entries) if !entries.is_empty() => DictLookupState::Found(entries),
+                        _ => DictLookupState::NotFound(raw_trimmed),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn reader_save_dict_as_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note_line) = self.reader.as_ref().and_then(|r| match &r.dict_lookup {
+            Some(DictLookupState::Found(entries)) => entries.first().map(|e| e.format_as_note()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let existing_val = self.highlight_note_input.read(cx).value().trim().to_string();
+        let next_note = if existing_val.is_empty() {
+            note_line
+        } else if existing_val.contains(&note_line) {
+            existing_val
+        } else {
+            format!("{existing_val}\n{note_line}")
+        };
+        self.highlight_note_input
+            .update(cx, |inp, cx| inp.set_value(next_note, window, cx));
+        self.reader_save_highlight_draft(window, cx);
+    }
+
+    pub fn download_offline_dictionary(&mut self, cx: &mut Context<Self>) {
+        if self.dict_downloading {
+            return;
+        }
+        self.dict_downloading = true;
+        self.status_banner = Some("Downloading offline EN/RU dictionary pack…".to_string());
+        cx.notify();
+        let dict_dir = self.dict_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { download_offline_pack(&dict_dir, DEFAULT_DICT_PACK_URL) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.dict_downloading = false;
+                match res {
+                    Ok(stats) => {
+                        app.dict_store.borrow_mut().reload();
+                        app.dict_stats = stats.clone();
+                        app.status_banner = Some(format!(
+                            "Offline EN/RU dictionary ready ({} lemmas, {} forms)",
+                            stats.lemma_count, stats.form_count
+                        ));
+                    }
+                    Err(err) => {
+                        app.status_banner =
+                            Some(format!("Dictionary download failed: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn reader_copy_active_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -131,8 +131,12 @@ pub enum HighlightDecoration {
     #[default]
     Highlight,
     Underline,
+    Dotted,
+    Dashed,
+    Double,
     Squiggly,
     Strikethrough,
+    Tint,
 }
 
 impl HighlightDecoration {
@@ -140,8 +144,12 @@ impl HighlightDecoration {
         &[
             Self::Highlight,
             Self::Underline,
+            Self::Dotted,
+            Self::Dashed,
+            Self::Double,
             Self::Squiggly,
             Self::Strikethrough,
+            Self::Tint,
         ]
     }
 
@@ -149,9 +157,17 @@ impl HighlightDecoration {
         match self {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
+            Self::Dotted => "Dotted",
+            Self::Dashed => "Dashed",
+            Self::Double => "Double",
             Self::Squiggly => "Squiggly",
             Self::Strikethrough => "Strike",
+            Self::Tint => "Tint",
         }
+    }
+
+    pub fn is_custom_line(self) -> bool {
+        matches!(self, Self::Dotted | Self::Dashed | Self::Double)
     }
 }
 

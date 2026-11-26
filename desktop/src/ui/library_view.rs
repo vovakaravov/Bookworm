@@ -97,6 +97,7 @@ pub enum LibraryViewEvent {
         new_path: PathBuf,
     },
     ExportNotes,
+    DownloadDictionary,
     StatusToast(String),
     ErrorToast(String),
 }
@@ -2599,6 +2600,17 @@ impl Render for LibraryView {
                             .tooltip("Export highlights & notes for all books to Markdown (.md)")
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(LibraryViewEvent::ExportNotes);
+                            })),
+                    )
+                    .child(
+                        Button::new("lib-download-dict")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::BookOpen)
+                            .label("EN/RU Dict")
+                            .tooltip("Download / Update Offline EN/RU Dictionary Pack")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(LibraryViewEvent::DownloadDictionary);
                             })),
                     )
                     .child(

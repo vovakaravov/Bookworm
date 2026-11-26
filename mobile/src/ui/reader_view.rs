@@ -1,6 +1,7 @@
 use super::image_util::decode_bytes_image;
 use super::{
-    BookwormMobileApp, PageTouchMode, ReaderState, SelectionHandleKind, SliceRenderKey,
+    BookwormMobileApp, DictLookupState, PageTouchMode, ReaderState, SelectionHandleKind,
+    SliceRenderKey, SliceRenderValue,
 };
 use crate::theme::{ReaderPalette, ReaderTheme, hex_alpha, hex_color};
 use bookworm_core::epub::{EpubBlock, EpubRun};
@@ -120,13 +121,6 @@ pub fn flatten_block_highlights(
             match hl.style {
                 HighlightDecoration::Highlight => {
                     style.background_color = Some(highlight_fill_alpha(hl.color, light_paper));
-                    if !hl.note.trim().is_empty() {
-                        style.underline = Some(UnderlineStyle {
-                            thickness: px(1.5),
-                            color: Some(solid),
-                            wavy: false,
-                        });
-                    }
                 }
                 HighlightDecoration::Underline => {
                     style.underline = Some(UnderlineStyle {
@@ -135,6 +129,9 @@ pub fn flatten_block_highlights(
                         wavy: false,
                     });
                 }
+                HighlightDecoration::Dotted
+                | HighlightDecoration::Dashed
+                | HighlightDecoration::Double => {}
                 HighlightDecoration::Squiggly => {
                     style.underline = Some(UnderlineStyle {
                         thickness: px(2.0),
@@ -147,6 +144,9 @@ pub fn flatten_block_highlights(
                         thickness: px(1.5),
                         color: Some(solid),
                     });
+                }
+                HighlightDecoration::Tint => {
+                    style.color = Some(solid);
                 }
             }
         }
@@ -189,6 +189,51 @@ pub fn split_blocks_two_columns(blocks: &[EpubBlock]) -> usize {
     split.clamp(1, blocks.len() - 1)
 }
 
+fn finish_styled_text_element(
+    disp_shared: SharedString,
+    flat: Vec<(Range<usize>, HighlightStyle)>,
+    custom_lines: Vec<(HighlightDecoration, Range<usize>, u32)>,
+    blk_idx: usize,
+    base_off: usize,
+    disp_len: usize,
+    rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
+) -> AnyElement {
+    let st = if flat.is_empty() {
+        StyledText::new(disp_shared.clone())
+    } else {
+        StyledText::new(disp_shared.clone()).with_highlights(flat)
+    };
+    let layout_for_paint = st.layout().clone();
+    if let Some(slot) = rendered_layouts {
+        slot.borrow_mut()
+            .push((blk_idx, base_off, disp_len, layout_for_paint.clone()));
+    }
+    if custom_lines.is_empty() {
+        st.into_any_element()
+    } else {
+        div()
+            .relative()
+            .w_full()
+            .child(st)
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        paint_custom_decoration_lines(
+                            &layout_for_paint,
+                            &disp_shared,
+                            &custom_lines,
+                            window,
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_paragraph_text(
     blk_idx: usize,
@@ -204,8 +249,7 @@ fn render_paragraph_text(
     light_paper: bool,
     highlights_epoch: u64,
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
-    slice_cache:
-        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
+    slice_cache: &RefCell<HashMap<SliceRenderKey, SliceRenderValue>>,
 ) -> AnyElement {
     let cache_key = slice.filter(|_| sel_range.is_none()).map(|sl| {
         (
@@ -218,19 +262,18 @@ fn render_paragraph_text(
         )
     });
     if let Some(ck) = cache_key
-        && let Some((cached_text, cached_flat)) = slice_cache.borrow().get(&ck)
+        && let Some((cached_text, cached_flat, cached_custom)) = slice_cache.borrow().get(&ck)
     {
         let disp_len = cached_text.len();
-        let st = if cached_flat.is_empty() {
-            StyledText::new(cached_text.clone())
-        } else {
-            StyledText::new(cached_text.clone()).with_highlights(cached_flat.clone())
-        };
-        if let Some(slot) = rendered_layouts {
-            slot.borrow_mut()
-                .push((blk_idx, ck.2, disp_len, st.layout().clone()));
-        }
-        return st.into_any_element();
+        return finish_styled_text_element(
+            cached_text.clone(),
+            cached_flat.clone(),
+            cached_custom.clone(),
+            blk_idx,
+            ck.2,
+            disp_len,
+            rendered_layouts,
+        );
     }
 
     let full_len = text.len();
@@ -289,23 +332,118 @@ fn render_paragraph_text(
         light_paper,
     );
     let disp_shared = SharedString::from(disp_text);
+    let custom_lines: Vec<(HighlightDecoration, Range<usize>, u32)> = block_hls
+        .iter()
+        .filter(|(hl, _)| hl.style.is_custom_line())
+        .map(|(hl, r)| (hl.style, r.clone(), hl.color.rgb_hex()))
+        .collect();
     if let Some(ck) = cache_key {
         let mut cache = slice_cache.borrow_mut();
         if cache.len() >= 128 {
             cache.clear();
         }
-        cache.insert(ck, (disp_shared.clone(), flat.clone()));
+        cache.insert(
+            ck,
+            (disp_shared.clone(), flat.clone(), custom_lines.clone()),
+        );
     }
-    let st = if flat.is_empty() {
-        StyledText::new(disp_shared)
-    } else {
-        StyledText::new(disp_shared).with_highlights(flat)
-    };
-    if let Some(slot) = rendered_layouts {
-        slot.borrow_mut()
-            .push((blk_idx, base_off, disp_len, st.layout().clone()));
+    finish_styled_text_element(
+        disp_shared,
+        flat,
+        custom_lines,
+        blk_idx,
+        base_off,
+        disp_len,
+        rendered_layouts,
+    )
+}
+
+fn paint_custom_decoration_lines(
+    layout: &TextLayout,
+    disp_text: &str,
+    custom_lines: &[(HighlightDecoration, Range<usize>, u32)],
+    window: &mut Window,
+) {
+    let lh = f32::from(layout.line_height()).max(12.0);
+    for (deco, range, rgb) in custom_lines {
+        let a = clamp_to_char_boundary(disp_text, range.start);
+        let b = clamp_to_char_boundary(disp_text, range.end);
+        if a >= b {
+            continue;
+        }
+        let color = hex_color(*rgb);
+        let mut line_segments: Vec<(f32, f32, f32)> = Vec::new();
+        for (rel, ch) in disp_text[a..b].char_indices() {
+            let off = a + rel;
+            let next = off + ch.len_utf8();
+            let Some(p0) = layout.position_for_index(off) else {
+                continue;
+            };
+            let x0 = f32::from(p0.x);
+            let y0 = f32::from(p0.y);
+            let x1 = match layout.position_for_index(next) {
+                Some(p1) if (f32::from(p1.y) - y0).abs() < 1.5 && f32::from(p1.x) > x0 => {
+                    f32::from(p1.x)
+                }
+                _ if ch.is_whitespace() => continue,
+                _ => x0 + 6.0,
+            };
+            if let Some(last) = line_segments.last_mut()
+                && (last.0 - y0).abs() < 1.5
+            {
+                last.1 = last.1.min(x0);
+                last.2 = last.2.max(x1);
+            } else {
+                line_segments.push((y0, x0, x1));
+            }
+        }
+        for (y0, x0, x1) in line_segments {
+            if x1 <= x0 {
+                continue;
+            }
+            let base_y = y0 + lh - 2.5;
+            match deco {
+                HighlightDecoration::Dotted => {
+                    let mut x = x0;
+                    while x + 2.0 <= x1 {
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(point(px(x), px(base_y - 1.2)), size(px(2.4), px(2.4))),
+                                color,
+                            )
+                            .corner_radii(px(1.2)),
+                        );
+                        x += 5.2;
+                    }
+                }
+                HighlightDecoration::Dashed => {
+                    let mut x = x0;
+                    while x < x1 {
+                        let w = (x1 - x).min(5.5);
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(point(px(x), px(base_y - 1.0)), size(px(w), px(2.0))),
+                                color,
+                            )
+                            .corner_radii(px(1.0)),
+                        );
+                        x += 9.0;
+                    }
+                }
+                HighlightDecoration::Double => {
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x0), px(base_y - 2.2)), size(px(x1 - x0), px(1.3))),
+                        color,
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x0), px(base_y + 0.6)), size(px(x1 - x0), px(1.3))),
+                        color,
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
-    st.into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,8 +460,7 @@ fn render_chapter_block(
     highlights: &[BookHighlight],
     highlights_epoch: u64,
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
-    slice_cache:
-        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
+    slice_cache: &RefCell<HashMap<SliceRenderKey, SliceRenderValue>>,
     decoded_images: &RefCell<HashMap<(usize, usize), Arc<Image>>>,
 ) -> AnyElement {
     let code_bg = hex_color(pal.surface);
@@ -505,8 +642,7 @@ fn render_page_spread_canvas(
     highlights_epoch: u64,
     selection_bounds: &[Option<Range<usize>>],
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
-    slice_cache:
-        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
+    slice_cache: &RefCell<HashMap<SliceRenderKey, SliceRenderValue>>,
     decoded_images: &RefCell<HashMap<(usize, usize), Arc<Image>>>,
 ) -> AnyElement {
     let build_col = |pg_opt: Option<&ChapterPage>| {
@@ -1739,8 +1875,15 @@ pub fn render_reader_view(
                                     };
                                     match mode {
                                         Some(PageTouchMode::HandleDrag(_)) => {
-                                            if let Some(r) = &mut app.reader {
+                                            let quote = if let Some(r) = &mut app.reader {
                                                 r.dragging_handle = None;
+                                                r.normalized_selection()
+                                                    .map(|(s, e)| r.extract_text_for_range(s, e))
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(q) = quote {
+                                                app.trigger_reader_dict_lookup(&q, cx);
                                             }
                                             cx.notify();
                                         }
@@ -2059,10 +2202,142 @@ pub fn render_reader_view(
     } else {
         (48.0 + app.safe_area.bottom).max(kb_height)
     };
+    let dict_lookup_state = r.dict_lookup.clone();
     let draft_bounds_tracker = draft_sheet_bounds_ref.clone();
     let floating_draft_sheet = draft.clone().map(|d| {
         let preview: String = d.quote.chars().take(90).collect();
         let has_existing = d.existing_id.is_some();
+        let dict_card: Option<AnyElement> = dict_lookup_state.clone().map(|dl| match dl {
+            DictLookupState::Loading(term) => h_flex()
+                .w_full()
+                .p_2()
+                .rounded(px(8.))
+                .bg(hex_color(pal.quote_bg))
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hex_color(pal.muted))
+                        .child(format!("Looking up \"{term}\"…")),
+                )
+                .into_any_element(),
+            DictLookupState::NotFound(term) => h_flex()
+                .w_full()
+                .p_2()
+                .rounded(px(8.))
+                .bg(hex_color(pal.quote_bg))
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hex_color(pal.muted))
+                        .child(format!("No entry found for \"{term}\"")),
+                )
+                .into_any_element(),
+            DictLookupState::Found(entries) => {
+                let top = entries.first();
+                v_flex()
+                    .w_full()
+                    .p_2()
+                    .gap_1()
+                    .rounded(px(8.))
+                    .bg(hex_color(pal.quote_bg))
+                    .border_1()
+                    .border_color(hex_color(pal.border))
+                    .when_some(top, |box_el, entry| {
+                        let hw = entry.display_headword().to_string();
+                        let meta_line = [
+                            (!entry.ipa.is_empty()).then(|| format!("[{}]", entry.ipa)),
+                            (!entry.pos.is_empty()).then(|| entry.pos.clone()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                        let infl_line = entry.matched_form.as_ref().map(|mf| match &entry.gram_tag {
+                            Some(gt) => format!("form of {hw} ({gt}) · tapped: {mf}"),
+                            None => format!("lemma for: {mf}"),
+                        });
+                        box_el
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1p5()
+                                            .items_center()
+                                            .flex_wrap()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(hex_color(pal.fg))
+                                                    .child(hw),
+                                            )
+                                            .when(!meta_line.is_empty(), |r| {
+                                                r.child(
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(hex_color(pal.muted))
+                                                        .child(meta_line),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(px(4.))
+                                                    .bg(hex_color(pal.surface))
+                                                    .text_size(px(9.5))
+                                                    .text_color(hex_color(pal.accent))
+                                                    .child(entry.source.badge()),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("hl-dict-save-note")
+                                            .primary()
+                                            .xsmall()
+                                            .label("Save as Note")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.reader_save_dict_as_note(window, cx);
+                                            })),
+                                    ),
+                            )
+                            .when_some(infl_line, |col, txt| {
+                                col.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .italic()
+                                        .text_color(hex_color(pal.muted))
+                                        .child(txt),
+                                )
+                            })
+                            .children(entry.glosses.iter().take(3).enumerate().map(|(ix, g)| {
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(hex_color(pal.fg))
+                                    .child(format!("{}. {g}", ix + 1))
+                            }))
+                            .when_some(entry.ru_translation.clone(), |col, ru| {
+                                col.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(hex_color(pal.accent))
+                                        .child(format!("RU: {ru}")),
+                                )
+                            })
+                    })
+                    .into_any_element()
+            }
+        });
         div()
             .id("rdr-draft-sheet-overlay")
             .absolute()
@@ -2097,6 +2372,7 @@ pub fn render_reader_view(
                         .absolute()
                         .inset_0(),
                     )
+                    .when_some(dict_card, |col, card| col.child(card))
                     .child(
                         div()
                             .text_xs()
@@ -2141,42 +2417,46 @@ pub fn render_reader_view(
                             ),
                     )
                     .child(
-                        h_flex()
+                        v_flex()
                             .w_full()
-                            .gap_1p5()
-                            .children(HighlightDecoration::all().iter().copied().map(|st| {
-                                let active = d.style == st;
-                                div()
-                                    .id(SharedString::from(format!("hs-{}", st.label())))
-                                    .flex_1()
-                                    .py_1()
-                                    .rounded(px(7.))
-                                    .cursor_pointer()
-                                    .bg(hex_color(if active {
-                                        pal.accent
-                                    } else {
-                                        pal.quote_bg
-                                    }))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(hex_color(if active {
-                                        0x181619
-                                    } else {
-                                        pal.fg
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(ReaderState {
-                                            draft: Some(dr), ..
-                                        }) = &mut this.reader
-                                        {
-                                            dr.style = st;
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child(st.label())
+                            .gap_1()
+                            .children(HighlightDecoration::all().chunks(4).map(|row_styles| {
+                                h_flex().w_full().gap_1p5().children(row_styles.iter().copied().map(
+                                    |st| {
+                                        let active = d.style == st;
+                                        div()
+                                            .id(SharedString::from(format!("hs-{}", st.label())))
+                                            .flex_1()
+                                            .py_1()
+                                            .rounded(px(7.))
+                                            .cursor_pointer()
+                                            .bg(hex_color(if active {
+                                                pal.accent
+                                            } else {
+                                                pal.quote_bg
+                                            }))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(hex_color(if active {
+                                                0x181619
+                                            } else {
+                                                pal.fg
+                                            }))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(ReaderState {
+                                                    draft: Some(dr), ..
+                                                }) = &mut this.reader
+                                                {
+                                                    dr.style = st;
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(st.label())
+                                    },
+                                ))
                             })),
                     )
                     .child(Input::new(&app.highlight_note_input).small())

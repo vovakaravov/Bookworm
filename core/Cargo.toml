@@ -7,17 +7,19 @@ license = "MIT"
 
 [features]
 default = []
-online-metadata = ["dep:ureq"]
+online-metadata = []
 
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
+flate2 = "1"
 percent-encoding = "2"
 roxmltree = "0.21.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = { version = "3", optional = true }
+ureq = "3"
 walkdir = "2"
 zip = { version = "9.8.0", default-features = false, features = ["deflate"] }
 

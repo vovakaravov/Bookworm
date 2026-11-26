@@ -1,6 +1,9 @@
 use super::find_bar::{FIND_INPUT_W, find_count_badge, floating_find_card};
 use super::image_util::decode_bytes_image;
 use super::{BookTab, BookwormApp};
+use bookworm_core::dictionary::{
+    DictionaryEntry, DictionaryStore, extract_lookup_word, lookup_online_and_cache,
+};
 use bookworm_core::epub::{EpubBlock, EpubBook, EpubRun, GlobalBookLocation, OutlineEntry};
 use bookworm_core::find_all_byte_ranges;
 use bookworm_core::library::{
@@ -22,8 +25,8 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, StrikethroughStyle, Styled, StyledImage as _,
-    StyledText, Subscription, TextLayout, UnderlineStyle, Window, canvas, div, img, point,
-    prelude::FluentBuilder as _, px, relative,
+    StyledText, Subscription, TextLayout, UnderlineStyle, Window, canvas, div, fill, img, point,
+    prelude::FluentBuilder as _, px, relative, size,
 };
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -70,6 +73,13 @@ struct TextPos {
 enum AnnotationsTab {
     Highlights,
     Bookmarks,
+}
+
+#[derive(Debug, Clone)]
+enum DictLookupState {
+    Loading(String),
+    Found(Vec<DictionaryEntry>),
+    NotFound(String),
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +146,10 @@ pub struct EpubView {
     needs_page_recompute: bool,
     last_wheel_page_at: Option<std::time::Instant>,
     decoded_images: RefCell<HashMap<(usize, usize), Arc<gpui_kit::Image>>>,
+    dict_dir: PathBuf,
+    dict_store: Rc<RefCell<DictionaryStore>>,
+    dict_lookup: Option<DictLookupState>,
+    dict_lookup_gen: u64,
 }
 
 impl EventEmitter<EpubViewEvent> for EpubView {}
@@ -268,13 +282,6 @@ fn flatten_block_highlights(
             match hl.style {
                 HighlightDecoration::Highlight => {
                     style.background_color = Some(highlight_fill_alpha(hl.color, light_paper));
-                    if !hl.note.trim().is_empty() {
-                        style.underline = Some(UnderlineStyle {
-                            thickness: px(1.5),
-                            color: Some(solid),
-                            wavy: false,
-                        });
-                    }
                 }
                 HighlightDecoration::Underline => {
                     style.underline = Some(UnderlineStyle {
@@ -283,6 +290,9 @@ fn flatten_block_highlights(
                         wavy: false,
                     });
                 }
+                HighlightDecoration::Dotted
+                | HighlightDecoration::Dashed
+                | HighlightDecoration::Double => {}
                 HighlightDecoration::Squiggly => {
                     style.underline = Some(UnderlineStyle {
                         thickness: px(2.0),
@@ -295,6 +305,9 @@ fn flatten_block_highlights(
                         thickness: px(1.5),
                         color: Some(solid),
                     });
+                }
+                HighlightDecoration::Tint => {
+                    style.color = Some(solid);
                 }
             }
         }
@@ -322,6 +335,94 @@ fn flatten_block_highlights(
     }
 
     out
+}
+
+fn paint_custom_decoration_lines(
+    layout: &TextLayout,
+    disp_text: &str,
+    custom_lines: &[(HighlightDecoration, Range<usize>, u32)],
+    window: &mut Window,
+) {
+    let lh = f32::from(layout.line_height()).max(12.0);
+    for (deco, range, rgb) in custom_lines {
+        let a = clamp_to_char_boundary(disp_text, range.start);
+        let b = clamp_to_char_boundary(disp_text, range.end);
+        if a >= b {
+            continue;
+        }
+        let color = hex_color(*rgb);
+        let mut line_segments: Vec<(f32, f32, f32)> = Vec::new();
+        for (rel, ch) in disp_text[a..b].char_indices() {
+            let off = a + rel;
+            let next = off + ch.len_utf8();
+            let Some(p0) = layout.position_for_index(off) else {
+                continue;
+            };
+            let x0 = f32::from(p0.x);
+            let y0 = f32::from(p0.y);
+            let x1 = match layout.position_for_index(next) {
+                Some(p1) if (f32::from(p1.y) - y0).abs() < 1.5 && f32::from(p1.x) > x0 => {
+                    f32::from(p1.x)
+                }
+                _ if ch.is_whitespace() => continue,
+                _ => x0 + 6.0,
+            };
+            if let Some(last) = line_segments.last_mut()
+                && (last.0 - y0).abs() < 1.5
+            {
+                last.1 = last.1.min(x0);
+                last.2 = last.2.max(x1);
+            } else {
+                line_segments.push((y0, x0, x1));
+            }
+        }
+        for (y0, x0, x1) in line_segments {
+            if x1 <= x0 {
+                continue;
+            }
+            let base_y = y0 + lh - 2.5;
+            match deco {
+                HighlightDecoration::Dotted => {
+                    let mut x = x0;
+                    while x + 2.0 <= x1 {
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(point(px(x), px(base_y - 1.2)), size(px(2.4), px(2.4))),
+                                color,
+                            )
+                            .corner_radii(px(1.2)),
+                        );
+                        x += 5.2;
+                    }
+                }
+                HighlightDecoration::Dashed => {
+                    let mut x = x0;
+                    while x < x1 {
+                        let w = (x1 - x).min(5.5);
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(point(px(x), px(base_y - 1.0)), size(px(w), px(2.0))),
+                                color,
+                            )
+                            .corner_radii(px(1.0)),
+                        );
+                        x += 9.0;
+                    }
+                }
+                HighlightDecoration::Double => {
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x0), px(base_y - 2.2)), size(px(x1 - x0), px(1.3))),
+                        color,
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(point(px(x0), px(base_y + 0.6)), size(px(x1 - x0), px(1.3))),
+                        color,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl EpubView {
@@ -378,6 +479,11 @@ impl EpubView {
         };
         let mut prefs = prefs;
         prefs.pagination = ReaderPaginationPref::Page;
+        let dict_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("bookworm")
+            .join("dictionaries");
+        let dict_store = Rc::new(RefCell::new(DictionaryStore::open(dict_dir.clone())));
 
         Self {
             path,
@@ -432,6 +538,10 @@ impl EpubView {
             needs_page_recompute: true,
             last_wheel_page_at: None,
             decoded_images: RefCell::new(HashMap::new()),
+            dict_dir,
+            dict_store,
+            dict_lookup: None,
+            dict_lookup_gen: 0,
         }
     }
 
@@ -879,6 +989,48 @@ impl EpubView {
         self.pending_click_highlight_id = None;
         self.popup = None;
         self.note_needs_focus = false;
+        self.dict_lookup = None;
+        self.dict_lookup_gen = self.dict_lookup_gen.wrapping_add(1);
+    }
+
+    pub fn reload_dictionary(&mut self, cx: &mut Context<Self>) {
+        self.dict_store.borrow_mut().reload();
+        cx.notify();
+    }
+
+    fn trigger_dict_lookup(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.dict_lookup_gen = self.dict_lookup_gen.wrapping_add(1);
+        let lookup_seq = self.dict_lookup_gen;
+        let Some(term) = extract_lookup_word(query) else {
+            self.dict_lookup = None;
+            return;
+        };
+
+        if let Some(hits) = self.dict_store.borrow_mut().lookup_offline(&term) {
+            self.dict_lookup = Some(DictLookupState::Found(hits));
+            return;
+        }
+
+        self.dict_lookup = Some(DictLookupState::Loading(term.clone()));
+        let dict_dir = self.dict_dir.clone();
+        let raw_trimmed = query.trim().to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { lookup_online_and_cache(&term, &dict_dir) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.dict_lookup_gen == lookup_seq {
+                    view.dict_store.borrow_mut().reload();
+                    view.dict_lookup = Some(match res {
+                        Some(entries) if !entries.is_empty() => DictLookupState::Found(entries),
+                        _ => DictLookupState::NotFound(raw_trimmed),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn current_chapter_block_text(&self, blk_ix: usize) -> Option<&str> {
@@ -1049,14 +1201,15 @@ impl EpubView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(note) = self
+        let Some(hl_ref) = self
             .highlights
             .iter()
             .find(|h| h.id == highlight_id)
-            .map(|h| h.note.clone())
         else {
             return;
         };
+        let note = hl_ref.note.clone();
+        let quote = hl_ref.quote.clone();
         self.selection_anchor = None;
         self.selection_head = None;
         self.note_editor
@@ -1066,6 +1219,7 @@ impl EpubView {
             highlight_id: highlight_id.to_string(),
             anchor_pos,
         });
+        self.trigger_dict_lookup(&quote, cx);
     }
 
     fn commit_selection_highlight(
@@ -1561,15 +1715,46 @@ impl EpubView {
             light_paper,
         );
 
+        let custom_lines: Vec<(HighlightDecoration, Range<usize>, u32)> = block_hls
+            .iter()
+            .filter(|(hl, _)| hl.style.is_custom_line())
+            .map(|(hl, r)| (hl.style, r.clone(), hl.color.rgb_hex()))
+            .collect();
+
+        let disp_owned = disp_text.to_string();
         let styled = if merged.is_empty() {
-            StyledText::new(disp_text.to_string())
+            StyledText::new(disp_owned.clone())
         } else {
-            StyledText::new(disp_text.to_string()).with_highlights(merged)
+            StyledText::new(disp_owned.clone()).with_highlights(merged)
         };
+        let layout_for_paint = styled.layout().clone();
         self.rendered_layouts
             .borrow_mut()
-            .push((blk_ix, base_off, disp_len, styled.layout().clone()));
-        styled.into_any_element()
+            .push((blk_ix, base_off, disp_len, layout_for_paint.clone()));
+        if custom_lines.is_empty() {
+            styled.into_any_element()
+        } else {
+            div()
+                .relative()
+                .w_full()
+                .child(styled)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            paint_custom_decoration_lines(
+                                &layout_for_paint,
+                                &disp_owned,
+                                &custom_lines,
+                                window,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .into_any_element()
+        }
     }
 
     fn render_find_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1701,6 +1886,21 @@ impl EpubView {
         match style {
             HighlightDecoration::Highlight => Icon::new(IconName::Highlighter).xsmall().into_any_element(),
             HighlightDecoration::Underline => Icon::new(IconName::Underline).xsmall().into_any_element(),
+            HighlightDecoration::Dotted => div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .child("···")
+                .into_any_element(),
+            HighlightDecoration::Dashed => div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .child("---")
+                .into_any_element(),
+            HighlightDecoration::Double => div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .child("═")
+                .into_any_element(),
             HighlightDecoration::Squiggly => div()
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
@@ -1709,11 +1909,18 @@ impl EpubView {
             HighlightDecoration::Strikethrough => {
                 Icon::new(IconName::Strikethrough).xsmall().into_any_element()
             }
+            HighlightDecoration::Tint => div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(hex_color(kd::ACCENT))
+                .child("A")
+                .into_any_element(),
         }
     }
 
     fn render_highlight_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let popup = self.popup.clone()?;
+        let dict_state = self.dict_lookup.clone();
         let vp = self.viewport_bounds.get();
         let card_bg = hex_color(kd::BG_SIDEBAR);
         let panel_bg = hex_color(kd::BG_PANEL);
@@ -1738,7 +1945,12 @@ impl EpubView {
                     return None;
                 }
 
-                let (pop_w, pop_h) = if note_mode { (360.0, 248.0) } else { (346.0, 44.0) };
+                let has_dict = dict_state.is_some();
+                let (pop_w, pop_h) = if note_mode {
+                    (400.0, if has_dict { 340.0 } else { 256.0 })
+                } else {
+                    (436.0, if has_dict { 196.0 } else { 44.0 })
+                };
                 let lx = f32::from(anchor_pos.x - vp.origin.x);
                 let ly = f32::from(anchor_pos.y - vp.origin.y);
                 let left = (lx - pop_w * 0.5).clamp(12.0, (vp_w - pop_w - 12.0).max(12.0));
@@ -1749,18 +1961,159 @@ impl EpubView {
                 }
                 .clamp(10.0, (vp_h - pop_h - 10.0).max(10.0));
 
+                let dict_card: Option<AnyElement> = dict_state.map(|dl| match dl {
+                    DictLookupState::Loading(term) => h_flex()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(8.))
+                        .bg(deep_bg)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("Looking up \"{term}\"…")),
+                        )
+                        .into_any_element(),
+                    DictLookupState::NotFound(term) => h_flex()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(8.))
+                        .bg(deep_bg)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("No dictionary entry found for \"{term}\"")),
+                        )
+                        .into_any_element(),
+                    DictLookupState::Found(entries) => {
+                        let top_entry = entries.first().cloned();
+                        v_flex()
+                            .id("epub-hl-dict-card")
+                            .w_full()
+                            .p_2p5()
+                            .gap_1()
+                            .rounded(px(8.))
+                            .bg(deep_bg)
+                            .border_1()
+                            .border_color(border)
+                            .when_some(top_entry, |box_el, entry| {
+                                let hw = entry.display_headword().to_string();
+                                let meta = [
+                                    (!entry.ipa.is_empty()).then(|| format!("[{}]", entry.ipa)),
+                                    (!entry.pos.is_empty()).then(|| entry.pos.clone()),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                                let infl = entry.matched_form.as_ref().map(|mf| match &entry.gram_tag {
+                                    Some(gt) => format!("form of {hw} ({gt}) · selected: {mf}"),
+                                    None => format!("lemma for: {mf}"),
+                                });
+                                let note_to_save = entry.format_as_note();
+                                box_el
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap_1p5()
+                                                    .items_center()
+                                                    .flex_wrap()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(fg)
+                                                            .child(hw),
+                                                    )
+                                                    .when(!meta.is_empty(), |r| {
+                                                        r.child(
+                                                            div()
+                                                                .text_size(px(11.))
+                                                                .text_color(muted)
+                                                                .child(meta),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded(px(4.))
+                                                            .bg(panel_bg)
+                                                            .text_size(px(10.))
+                                                            .text_color(hex_color(kd::ACCENT))
+                                                            .child(entry.source.badge()),
+                                                    ),
+                                            )
+                                            .child(
+                                                Button::new("epub-dict-save-note")
+                                                    .primary()
+                                                    .xsmall()
+                                                    .icon(IconName::Check)
+                                                    .label("Save as Note")
+                                                    .tooltip("Save definition/translation as a note on this highlight")
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        this.commit_selection_highlight(
+                                                            selected_color,
+                                                            selected_style,
+                                                            note_to_save.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })),
+                                            ),
+                                    )
+                                    .when_some(infl, |col, txt| {
+                                        col.child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .italic()
+                                                .text_color(muted)
+                                                .child(txt),
+                                        )
+                                    })
+                                    .children(entry.glosses.iter().take(3).enumerate().map(|(ix, g)| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(fg)
+                                            .child(format!("{}. {g}", ix + 1))
+                                    }))
+                                    .when_some(entry.ru_translation.clone(), |col, ru| {
+                                        col.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(hex_color(kd::ACCENT))
+                                                .child(format!("RU: {ru}")),
+                                        )
+                                    })
+                            })
+                            .into_any_element()
+                    }
+                });
+
                 if !note_mode {
                     let quote_copy = quote;
                     return Some(
-                        h_flex()
+                        v_flex()
                             .id("epub-hl-sel-bar")
                             .absolute()
                             .left(px(left))
                             .top(px(top))
-                            .h(px(40.))
-                            .px_2p5()
+                            .w(px(pop_w))
+                            .p_2()
                             .gap_1p5()
-                            .items_center()
                             .rounded(px(10.))
                             .bg(card_bg)
                             .border_1()
@@ -1770,92 +2123,117 @@ impl EpubView {
                             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_scroll(|_, _, cx| cx.stop_propagation())
                             .occlude()
-                            .children(HighlightColor::all().iter().copied().map(|col| {
-                                let is_cur = col == selected_color;
-                                let solid = hex_color(col.rgb_hex());
-                                div()
-                                    .id(("epub-hl-swatch", col as usize))
-                                    .w(px(20.))
-                                    .h(px(20.))
-                                    .rounded_full()
-                                    .bg(solid)
-                                    .border_2()
-                                    .border_color(if is_cur { fg } else { deep_bg })
-                                    .cursor_pointer()
-                                    .hover(|s| s.border_color(fg))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.commit_selection_highlight(
-                                            col,
-                                            selected_style,
-                                            String::new(),
-                                            window,
-                                            cx,
-                                        );
-                                    }))
-                            }))
-                            .child(div().w(px(1.)).h(px(18.)).bg(border))
-                            .children(HighlightDecoration::all().iter().copied().map(|dec| {
-                                let is_cur = dec == selected_style;
-                                Button::new(SharedString::from(format!("epub-hl-dec-{}", dec.label())))
-                                    .with_variant(if is_cur {
-                                        ButtonVariant::Secondary
-                                    } else {
-                                        ButtonVariant::Ghost
-                                    })
-                                    .xsmall()
-                                    .tooltip(dec.label())
-                                    .child(Self::render_style_icon(dec))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(ActiveHighlightPopup::Selection {
-                                            selected_style: st,
-                                            ..
-                                        }) = &mut this.popup
-                                        {
-                                            *st = dec;
-                                        }
-                                        this.prefs.last_highlight_style = dec;
-                                        this.emit_prefs(cx);
-                                        cx.notify();
-                                    }))
-                            }))
-                            .child(div().w(px(1.)).h(px(18.)).bg(border))
                             .child(
-                                Button::new("epub-hl-note-btn")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::StickyNote)
-                                    .label("Note")
-                                    .tooltip("Highlight with Note")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.note_editor.update(cx, |ed, cx| {
-                                            ed.set_value("", window, cx);
-                                        });
-                                        if let Some(ActiveHighlightPopup::Selection {
-                                            note_mode,
-                                            ..
-                                        }) = &mut this.popup
-                                        {
-                                            *note_mode = true;
-                                        }
-                                        this.note_needs_focus = true;
-                                        cx.notify();
-                                    })),
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        h_flex().gap_1p5().items_center().children(
+                                            HighlightColor::all().iter().copied().map(|col| {
+                                                let is_cur = col == selected_color;
+                                                let solid = hex_color(col.rgb_hex());
+                                                div()
+                                                    .id(("epub-hl-swatch", col as usize))
+                                                    .w(px(18.))
+                                                    .h(px(18.))
+                                                    .rounded_full()
+                                                    .bg(solid)
+                                                    .border_2()
+                                                    .border_color(if is_cur { fg } else { deep_bg })
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.border_color(fg))
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        this.commit_selection_highlight(
+                                                            col,
+                                                            selected_style,
+                                                            String::new(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }))
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(
+                                                Button::new("epub-hl-note-btn")
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::StickyNote)
+                                                    .label("Note")
+                                                    .tooltip("Highlight with Note")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.note_editor.update(cx, |ed, cx| {
+                                                            ed.set_value("", window, cx);
+                                                        });
+                                                        if let Some(ActiveHighlightPopup::Selection {
+                                                            note_mode,
+                                                            ..
+                                                        }) = &mut this.popup
+                                                        {
+                                                            *note_mode = true;
+                                                        }
+                                                        this.note_needs_focus = true;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("epub-hl-copy-btn")
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Copy)
+                                                    .tooltip("Copy Selected Passage")
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                                            quote_copy.clone(),
+                                                        ));
+                                                        this.clear_selection_and_popup();
+                                                        this.focus_handle.focus(window, cx);
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
                             )
                             .child(
-                                Button::new("epub-hl-copy-btn")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Copy)
-                                    .tooltip("Copy Selected Passage")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            quote_copy.clone(),
-                                        ));
-                                        this.clear_selection_and_popup();
-                                        this.focus_handle.focus(window, cx);
-                                        cx.notify();
+                                h_flex()
+                                    .w_full()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .children(HighlightDecoration::all().iter().copied().map(|dec| {
+                                        let is_cur = dec == selected_style;
+                                        Button::new(SharedString::from(format!(
+                                            "epub-hl-dec-{}",
+                                            dec.label()
+                                        )))
+                                        .with_variant(if is_cur {
+                                            ButtonVariant::Secondary
+                                        } else {
+                                            ButtonVariant::Ghost
+                                        })
+                                        .xsmall()
+                                        .tooltip(dec.label())
+                                        .child(Self::render_style_icon(dec))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(ActiveHighlightPopup::Selection {
+                                                selected_style: st,
+                                                ..
+                                            }) = &mut this.popup
+                                            {
+                                                *st = dec;
+                                            }
+                                            this.prefs.last_highlight_style = dec;
+                                            this.emit_prefs(cx);
+                                            cx.notify();
+                                        }))
                                     })),
                             )
+                            .when_some(dict_card, |col, card| col.child(card))
                             .into_any_element(),
                     );
                 }
@@ -1892,10 +2270,10 @@ impl EpubView {
                                 cx.notify();
                             }
                         }))
+                        .when_some(dict_card, |col, card| col.child(card))
                         .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
+                            v_flex()
+                                .gap_1()
                                 .child(
                                     h_flex().gap_1p5().items_center().children(
                                         HighlightColor::all().iter().copied().map(|col| {
@@ -1923,7 +2301,7 @@ impl EpubView {
                                     ),
                                 )
                                 .child(
-                                    h_flex().gap_0p5().items_center().children(
+                                    h_flex().gap_0p5().items_center().flex_wrap().children(
                                         HighlightDecoration::all().iter().copied().map(|dec| {
                                             let is_cur = dec == selected_style;
                                             Button::new(SharedString::from(format!(
@@ -2022,7 +2400,7 @@ impl EpubView {
                 anchor_pos,
             } => {
                 let hl = self.highlights.iter().find(|h| h.id == highlight_id)?.clone();
-                let (pop_w, pop_h) = (360.0, 260.0);
+                let (pop_w, pop_h) = (400.0, if dict_state.is_some() { 340.0 } else { 268.0 });
                 let lx = f32::from(anchor_pos.x - vp.origin.x);
                 let ly = f32::from(anchor_pos.y - vp.origin.y);
                 let left = (lx - pop_w * 0.5).clamp(12.0, (vp_w - pop_w - 12.0).max(12.0));
@@ -2041,7 +2419,130 @@ impl EpubView {
                 let hl_id_copy = hl.id.clone();
                 let hl_id_del = hl.id.clone();
                 let hl_id_save = hl.id.clone();
+                let hl_id_dict_save = hl.id.clone();
                 let quote_copy = hl.quote.clone();
+
+                let insp_dict_card: Option<AnyElement> = dict_state.map(|dl| match dl {
+                    DictLookupState::Loading(term) => h_flex()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(8.))
+                        .bg(deep_bg)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("Looking up \"{term}\"…")),
+                        )
+                        .into_any_element(),
+                    DictLookupState::NotFound(term) => h_flex()
+                        .w_full()
+                        .p_2()
+                        .rounded(px(8.))
+                        .bg(deep_bg)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("No dictionary entry found for \"{term}\"")),
+                        )
+                        .into_any_element(),
+                    DictLookupState::Found(entries) => {
+                        let top_entry = entries.first().cloned();
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1()
+                            .rounded(px(8.))
+                            .bg(deep_bg)
+                            .border_1()
+                            .border_color(border)
+                            .when_some(top_entry, |box_el, entry| {
+                                let hw = entry.display_headword().to_string();
+                                let meta = [
+                                    (!entry.ipa.is_empty()).then(|| format!("[{}]", entry.ipa)),
+                                    (!entry.pos.is_empty()).then(|| entry.pos.clone()),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                                let note_to_save = entry.format_as_note();
+                                box_el
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap_1p5()
+                                                    .items_center()
+                                                    .flex_wrap()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(fg)
+                                                            .child(hw),
+                                                    )
+                                                    .when(!meta.is_empty(), |r| {
+                                                        r.child(
+                                                            div()
+                                                                .text_size(px(11.))
+                                                                .text_color(muted)
+                                                                .child(meta),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("epub-insp-dict-save")
+                                                    .primary()
+                                                    .xsmall()
+                                                    .icon(IconName::Check)
+                                                    .label("Save as Note")
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        let cur = this
+                                                            .note_editor
+                                                            .read(cx)
+                                                            .value()
+                                                            .trim()
+                                                            .to_string();
+                                                        let next = if cur.is_empty() {
+                                                            note_to_save.clone()
+                                                        } else if cur.contains(&note_to_save) {
+                                                            cur
+                                                        } else {
+                                                            format!("{cur}\n{}", note_to_save)
+                                                        };
+                                                        this.note_editor.update(cx, |ed, cx| {
+                                                            ed.set_value(next, window, cx);
+                                                        });
+                                                        this.save_inspected_highlight_note(
+                                                            &hl_id_dict_save,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })),
+                                            ),
+                                    )
+                                    .children(entry.glosses.iter().take(2).enumerate().map(|(ix, g)| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(fg)
+                                            .child(format!("{}. {g}", ix + 1))
+                                    }))
+                            })
+                            .into_any_element()
+                    }
+                });
 
                 Some(
                     v_flex()
@@ -2051,7 +2552,7 @@ impl EpubView {
                         .top(px(top))
                         .w(px(pop_w))
                         .p_3()
-                        .gap_2p5()
+                        .gap_2()
                         .rounded(px(10.))
                         .bg(card_bg)
                         .border_1()
@@ -2069,10 +2570,10 @@ impl EpubView {
                                 cx.notify();
                             }
                         }))
+                        .when_some(insp_dict_card, |col, card| col.child(card))
                         .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
+                            v_flex()
+                                .gap_1()
                                 .child(
                                     h_flex().gap_1p5().items_center().children(
                                         HighlightColor::all().iter().copied().map(|col| {
@@ -2099,7 +2600,7 @@ impl EpubView {
                                     ),
                                 )
                                 .child(
-                                    h_flex().gap_0p5().items_center().children(
+                                    h_flex().gap_0p5().items_center().flex_wrap().children(
                                         HighlightDecoration::all().iter().copied().map(|dec| {
                                             let is_cur = dec == hl.style;
                                             let target_id = hl_id_copy.clone();
@@ -3376,9 +3877,10 @@ impl Render for EpubView {
                                         return;
                                     };
                                     if ev.click_count >= 3 {
-                                        if let Some(txt) =
-                                            this.current_chapter_block_text(hit.block_idx)
-                                            && !txt.is_empty()
+                                        if let Some(txt_owned) = this
+                                            .current_chapter_block_text(hit.block_idx)
+                                            .filter(|t| !t.is_empty())
+                                            .map(str::to_string)
                                         {
                                             let start = TextPos {
                                                 block_idx: hit.block_idx,
@@ -3386,7 +3888,7 @@ impl Render for EpubView {
                                             };
                                             let end = TextPos {
                                                 block_idx: hit.block_idx,
-                                                byte_offset: txt.len(),
+                                                byte_offset: txt_owned.len(),
                                             };
                                             this.selection_anchor = Some(start);
                                             this.selection_head = Some(end);
@@ -3399,6 +3901,7 @@ impl Render for EpubView {
                                                 selected_color: this.prefs.last_highlight_color,
                                                 selected_style: this.prefs.last_highlight_style,
                                             });
+                                            this.trigger_dict_lookup(&txt_owned, cx);
                                             cx.notify();
                                         }
                                         return;
@@ -3409,6 +3912,7 @@ impl Render for EpubView {
                                         {
                                             let r = word_bounds_at(txt, hit.byte_offset);
                                             if r.start < r.end {
+                                                let word_str = txt[r.start..r.end].to_string();
                                                 let start = TextPos {
                                                     block_idx: hit.block_idx,
                                                     byte_offset: r.start,
@@ -3433,6 +3937,7 @@ impl Render for EpubView {
                                                             .prefs
                                                             .last_highlight_style,
                                                     });
+                                                this.trigger_dict_lookup(&word_str, cx);
                                                 cx.notify();
                                                 return;
                                             }
@@ -3478,14 +3983,16 @@ impl Render for EpubView {
                                         return;
                                     }
                                     this.is_dragging_selection = false;
-                                    if let Some((start, _end)) = this.normalized_selection() {
+                                    if let Some((start, end)) = this.normalized_selection() {
                                         let anchor_pos = this.anchor_for_pos(start, ev.position);
+                                        let quote = this.extract_text_for_range(start, end);
                                         this.popup = Some(ActiveHighlightPopup::Selection {
                                             anchor_pos,
                                             note_mode: false,
                                             selected_color: this.prefs.last_highlight_color,
                                             selected_style: this.prefs.last_highlight_style,
                                         });
+                                        this.trigger_dict_lookup(&quote, cx);
                                     } else if let Some(hl_id) =
                                         this.pending_click_highlight_id.take()
                                     {
@@ -3508,14 +4015,16 @@ impl Render for EpubView {
                                         return;
                                     }
                                     this.is_dragging_selection = false;
-                                    if let Some((start, _end)) = this.normalized_selection() {
+                                    if let Some((start, end)) = this.normalized_selection() {
                                         let anchor_pos = this.anchor_for_pos(start, ev.position);
+                                        let quote = this.extract_text_for_range(start, end);
                                         this.popup = Some(ActiveHighlightPopup::Selection {
                                             anchor_pos,
                                             note_mode: false,
                                             selected_color: this.prefs.last_highlight_color,
                                             selected_style: this.prefs.last_highlight_style,
                                         });
+                                        this.trigger_dict_lookup(&quote, cx);
                                     } else {
                                         this.clear_selection_and_popup();
                                     }

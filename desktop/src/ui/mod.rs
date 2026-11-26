@@ -124,6 +124,8 @@ pub struct BookwormApp {
     pub active_tab: Option<usize>,
     pub zen_mode: bool,
     pub outline_scroll: ScrollHandle,
+    pub dict_dir: PathBuf,
+    pub dict_downloading: bool,
     focus_handle: FocusHandle,
     toast: Option<(String, bool)>,
     toast_gen: u64,
@@ -170,6 +172,9 @@ impl BookwormApp {
                 LibraryViewEvent::ExportNotes => {
                     app.export_notes_to_markdown(cx);
                 }
+                LibraryViewEvent::DownloadDictionary => {
+                    app.download_offline_dictionary(cx);
+                }
                 LibraryViewEvent::StatusToast(msg) => {
                     app.show_toast(msg.clone(), false, cx);
                 }
@@ -178,6 +183,15 @@ impl BookwormApp {
                 }
             }
         });
+
+        let dict_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("bookworm")
+            .join("dictionaries");
+        let _ = bookworm_core::dictionary::DictionaryStore::maybe_import_from(
+            &workspace_root.join("Dictionaries").join("en-ru.db"),
+            &dict_dir,
+        );
 
         let mut app = Self {
             config,
@@ -188,6 +202,8 @@ impl BookwormApp {
             active_tab: None,
             zen_mode: false,
             outline_scroll: ScrollHandle::new(),
+            dict_dir,
+            dict_downloading: false,
             focus_handle: cx.focus_handle(),
             toast: None,
             toast_gen: 0,
@@ -537,6 +553,54 @@ impl BookwormApp {
         } else {
             self.enter_zen_mode(window, cx);
         }
+    }
+
+    pub fn download_offline_dictionary(&mut self, cx: &mut Context<Self>) {
+        if self.dict_downloading {
+            return;
+        }
+        self.dict_downloading = true;
+        self.show_toast(
+            "Downloading offline EN/RU dictionary pack…".to_string(),
+            false,
+            cx,
+        );
+        let dict_dir = self.dict_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    bookworm_core::dictionary::download_offline_pack(
+                        &dict_dir,
+                        bookworm_core::dictionary::DEFAULT_DICT_PACK_URL,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.dict_downloading = false;
+                match res {
+                    Ok(stats) => {
+                        for tab in &app.tabs {
+                            if let Some(view) = &tab.view {
+                                view.update(cx, |v, cx| v.reload_dictionary(cx));
+                            }
+                        }
+                        app.show_toast(
+                            format!(
+                                "Offline EN/RU dictionary ready ({} lemmas, {} forms)",
+                                stats.lemma_count, stats.form_count
+                            ),
+                            false,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        app.show_toast(format!("Dictionary download failed: {err}"), true, cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn handle_toggle_zen_mode(

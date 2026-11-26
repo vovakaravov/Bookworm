@@ -1,3 +1,4 @@
+pub mod dictionary;
 pub mod epub;
 pub mod export_md;
 pub mod library;
@@ -58,6 +59,99 @@ pub fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
 
     fs::write(path, content.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn decode_html_entity(ent: &str) -> Option<char> {
+    match ent {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        "mdash" => Some('—'),
+        "ndash" => Some('–'),
+        "rsquo" => Some('’'),
+        "lsquo" => Some('‘'),
+        "rdquo" => Some('”'),
+        "ldquo" => Some('“'),
+        "hellip" => Some('…'),
+        "copy" => Some('©'),
+        "reg" => Some('®'),
+        "trade" => Some('™'),
+        _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+            u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+        }
+        _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
+        _ => None,
+    }
+}
+
+/// Decodes common HTML/numeric entities in `s`.
+pub fn decode_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'&'
+            && let Some(semi_rel) = s[i + 1..].find(';')
+            && semi_rel > 0
+            && semi_rel <= 10
+        {
+            let ent = &s[i + 1..i + 1 + semi_rel];
+            if let Some(ch) = decode_html_entity(ent) {
+                out.push(ch);
+                i += 1 + semi_rel + 1;
+                continue;
+            }
+        }
+        if let Some(ch) = s[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Strips HTML tags and decodes entities, preserving line breaks at `<br>` and `</p>`.
+pub fn strip_html_and_entities(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    let mut text_with_tags = String::with_capacity(raw.len());
+    let mut chars = raw.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '<' {
+            let tail = &raw[idx..];
+            if let Some(gt) = tail.find('>') {
+                let tag_body = tail[1..gt].trim().to_ascii_lowercase();
+                if tag_body.starts_with("br") || tag_body.starts_with("/p") {
+                    text_with_tags.push('\n');
+                } else {
+                    text_with_tags.push(' ');
+                }
+                while let Some(&(next_i, _)) = chars.peek() {
+                    if next_i <= idx + gt {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        text_with_tags.push(ch);
+    }
+
+    let decoded = decode_html_entities(&text_with_tags);
+    decoded
+        .lines()
+        .map(|ln| ln.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|ln| !ln.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Lists direct non-hidden subdirectories of `dir`, sorted case-insensitively.
