@@ -4,8 +4,8 @@ pub mod reader_view;
 pub mod settings_view;
 
 use crate::config::{
-    BookwormMobileConfig, LibraryGridSize, app_cache_dir, app_storage_dir, books_root_candidates,
-    default_books_root, has_external_storage_access, state_root_for,
+    BookwormMobileConfig, LibraryGridSize, LibrarySort, app_cache_dir, app_storage_dir,
+    books_root_candidates, default_books_root, has_external_storage_access, state_root_for,
 };
 use crate::theme::ReaderTheme;
 use bookworm_core::epub::{EpubBlock, EpubBook, GlobalBookLocation, create_sample_epub};
@@ -152,6 +152,7 @@ pub struct ReaderState {
     pub show_settings: bool,
     pub show_toc: bool,
     pub show_notes: bool,
+    pub zen_mode: bool,
     pub notes_color_filter: Option<HighlightColor>,
     pub notes_only_filter: bool,
     pub draft: Option<HighlightEditorDraft>,
@@ -188,7 +189,6 @@ pub struct ReaderState {
     pub decoded_images: RefCell<HashMap<(usize, usize), Arc<Image>>>,
     pub pending_scroll_block: Option<(usize, usize)>,
     pub pending_scroll_fraction: Option<f32>,
-    pub scroll_jump_gen: u64,
     pub last_saved_scroll_pct: f32,
     pub scroll_save_scheduled: bool,
 }
@@ -577,6 +577,9 @@ pub struct BookwormMobileApp {
     pub library_state_root: PathBuf,
     pub library_store: LibraryStore,
     pub library_filter: LibraryFilter,
+    pub library_sort: LibrarySort,
+    pub library_shelf_filter: Option<String>,
+    pub library_drawer_open: bool,
     pub reader: Option<ReaderState>,
     pub last_opened_rel: Option<String>,
     pub folder_picker: Option<FolderPickerState>,
@@ -586,7 +589,6 @@ pub struct BookwormMobileApp {
     pub reader_theme: ReaderTheme,
     pub reader_font_size: f32,
     pub reader_width: ReaderWidthPref,
-    pub reader_pagination: ReaderPaginationPref,
     pub two_column_spread: bool,
     pub library_grid_size: LibraryGridSize,
     pub status_banner: Option<String>,
@@ -597,7 +599,7 @@ pub struct BookwormMobileApp {
 
     pub library_scroll: ScrollHandle,
     pub library_rows_scroll: UniformListScrollHandle,
-    pub reader_scroll: ScrollHandle,
+    pub library_drawer_scroll: ScrollHandle,
     pub toc_scroll: ScrollHandle,
     pub notes_scroll: ScrollHandle,
     pub settings_scroll: ScrollHandle,
@@ -844,7 +846,7 @@ impl BookwormMobileApp {
             .unwrap_or_else(default_books_root);
         let root_candidates = books_root_candidates(&books_root);
         let library_state_root = state_root_for(&books_root);
-        let (library_store, initial_conflicts) =
+        let (mut library_store, initial_conflicts) =
             LibraryStore::load_with_conflict_report(&library_state_root);
 
         let reader_theme = match library_store.reader_prefs.theme {
@@ -855,7 +857,7 @@ impl BookwormMobileApp {
         };
         let reader_font_size = library_store.reader_prefs.font_size.clamp(13.0, 28.0);
         let reader_width = library_store.reader_prefs.width;
-        let reader_pagination = library_store.reader_prefs.pagination;
+        library_store.reader_prefs.pagination = ReaderPaginationPref::Page;
 
         let library_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter books, authors, tags…"));
@@ -921,6 +923,9 @@ impl BookwormMobileApp {
             library_state_root,
             library_store,
             library_filter: LibraryFilter::All,
+            library_sort: cfg.library_sort,
+            library_shelf_filter: None,
+            library_drawer_open: false,
             reader: None,
             last_opened_rel: None,
             folder_picker: None,
@@ -929,7 +934,6 @@ impl BookwormMobileApp {
             reader_theme,
             reader_font_size,
             reader_width,
-            reader_pagination,
             two_column_spread: cfg.two_column_spread,
             library_grid_size: cfg.library_grid_size,
             status_banner: initial_banner,
@@ -938,7 +942,7 @@ impl BookwormMobileApp {
             folder_picker_input,
             library_scroll: ScrollHandle::new(),
             library_rows_scroll: UniformListScrollHandle::new(),
-            reader_scroll: ScrollHandle::new(),
+            library_drawer_scroll: ScrollHandle::new(),
             toc_scroll: ScrollHandle::new(),
             notes_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -982,6 +986,7 @@ impl BookwormMobileApp {
             books_root: Some(self.books_root.clone()),
             two_column_spread: self.two_column_spread,
             library_grid_size: self.library_grid_size,
+            library_sort: self.library_sort,
         };
         cx.background_executor()
             .spawn(async move {
@@ -994,6 +999,38 @@ impl BookwormMobileApp {
         if self.library_grid_size != size {
             self.library_grid_size = size;
             self.persist_mobile_config(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn set_library_sort(&mut self, sort: LibrarySort, cx: &mut Context<Self>) {
+        if self.library_sort != sort {
+            self.library_sort = sort;
+            self.persist_mobile_config(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn set_library_shelf_filter(&mut self, shelf: Option<String>, cx: &mut Context<Self>) {
+        if self.library_shelf_filter != shelf {
+            self.library_shelf_filter = shelf;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_library_drawer(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.library_drawer_open != open {
+            if open {
+                window.blur(cx);
+                gpui_mobile::hide_keyboard();
+                self.library_drawer_scroll.set_offset(point(px(0.), px(0.)));
+            }
+            self.library_drawer_open = open;
             cx.notify();
         }
     }
@@ -1494,6 +1531,12 @@ impl BookwormMobileApp {
                         cx.notify();
                         return;
                     }
+                    if r.zen_mode {
+                        r.zen_mode = false;
+                        r.needs_page_recompute = true;
+                        cx.notify();
+                        return;
+                    }
                 }
                 self.close_reader_to_library(window, cx);
             }
@@ -1501,6 +1544,11 @@ impl BookwormMobileApp {
                 self.close_settings(window, cx);
             }
             AppSurface::Library => {
+                if self.library_drawer_open {
+                    self.library_drawer_open = false;
+                    cx.notify();
+                    return;
+                }
                 if !self.library_search_input.read(cx).value().is_empty() {
                     self.library_search_input
                         .update(cx, |inp, cx| inp.set_value("", window, cx));
@@ -1533,45 +1581,24 @@ impl BookwormMobileApp {
         }
     }
 
-    pub(crate) fn compute_block_scroll_target_y(
-        block_win_y: f32,
-        viewport_top_y: f32,
-        current_offset_y: f32,
-        max_scroll_y: f32,
-        top_margin_px: f32,
-    ) -> f32 {
-        if max_scroll_y <= 0.0 {
-            return 0.0;
-        }
-        let content_y = (block_win_y - viewport_top_y) - current_offset_y;
-        (content_y - top_margin_px.max(0.0)).clamp(0.0, max_scroll_y)
-    }
-
     pub fn reader_current_scroll_pct(&self) -> f32 {
-        if self.reader_pagination == ReaderPaginationPref::Page
-            && let Some(r) = &self.reader
-        {
-            let tp = r.chapter_pages.len().max(1);
-            if tp <= 1 {
-                return if r.chapter_idx + 1 >= r.book.chapters.len() {
-                    1.0
-                } else {
-                    0.0
-                };
-            }
-            let two_col =
-                self.two_column_spread && f32::from(r.viewport_bounds.get().size.width) >= 700.0;
-            if two_col && r.current_page + 2 >= tp {
-                return 1.0;
-            }
-            return (r.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0);
-        }
-        let max_y = f32::from(self.reader_scroll.max_offset().y);
-        if max_y <= 0.0 {
+        let Some(r) = &self.reader else {
             return 0.0;
+        };
+        let tp = r.chapter_pages.len().max(1);
+        if tp <= 1 {
+            return if r.chapter_idx + 1 >= r.book.chapters.len() {
+                1.0
+            } else {
+                0.0
+            };
         }
-        let off_y = -f32::from(self.reader_scroll.offset().y);
-        (off_y / max_y).clamp(0.0, 1.0)
+        let two_col =
+            self.two_column_spread && f32::from(r.viewport_bounds.get().size.width) >= 700.0;
+        if two_col && r.current_page + 2 >= tp {
+            return 1.0;
+        }
+        (r.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0)
     }
 
     pub fn ensure_reader_pages_and_sync(
@@ -1581,9 +1608,6 @@ impl BookwormMobileApp {
         two_col: bool,
         window: &Window,
     ) {
-        if self.reader_pagination != ReaderPaginationPref::Page {
-            return;
-        }
         if vp_w < 100.0 || vp_h < 100.0 {
             return;
         }
@@ -1815,35 +1839,24 @@ impl BookwormMobileApp {
         cx: &mut Context<Self>,
     ) {
         self.flush_pending_page_flip(window, cx);
-        if self.reader_pagination == ReaderPaginationPref::Page {
-            let step = if use_two_col { 2isize } else { 1isize };
-            let can_advance = self.reader.as_ref().is_some_and(|r| {
-                r.current_page + (step as usize) < r.chapter_pages.len().max(1)
-                    || r.chapter_idx + 1 < r.book.chapters.len()
-            });
-            let vp_w = self
-                .reader
-                .as_ref()
-                .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
-                .unwrap_or(360.0);
-            if can_advance {
-                let sx = start_x.unwrap_or(0.0);
-                let dur = if sx.abs() > 1.0 { 175 } else { 210 };
-                self.reader_start_page_flip_anim(sx, -vp_w, 1, step, dur, cx);
-            } else if let Some(sx) = start_x
-                && sx.abs() > 1.0
-            {
-                self.reader_start_page_flip_anim(sx, 0.0, 0, 0, 160, cx);
-            }
-            return;
-        }
-        if let Some(r) = &self.reader {
-            let next_ch = r.chapter_idx + 1;
-            if next_ch < r.book.chapters.len() {
-                let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
-                self.reader_go_chapter(next_ch, window, cx);
-                self.reader_start_page_flip_anim(start_x.unwrap_or(vp_w * 0.42), 0.0, 1, 0, 200, cx);
-            }
+        let step = if use_two_col { 2isize } else { 1isize };
+        let can_advance = self.reader.as_ref().is_some_and(|r| {
+            r.current_page + (step as usize) < r.chapter_pages.len().max(1)
+                || r.chapter_idx + 1 < r.book.chapters.len()
+        });
+        let vp_w = self
+            .reader
+            .as_ref()
+            .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
+            .unwrap_or(360.0);
+        if can_advance {
+            let sx = start_x.unwrap_or(0.0);
+            let dur = if sx.abs() > 1.0 { 175 } else { 210 };
+            self.reader_start_page_flip_anim(sx, -vp_w, 1, step, dur, cx);
+        } else if let Some(sx) = start_x
+            && sx.abs() > 1.0
+        {
+            self.reader_start_page_flip_anim(sx, 0.0, 0, 0, 160, cx);
         }
     }
 
@@ -1855,35 +1868,24 @@ impl BookwormMobileApp {
         cx: &mut Context<Self>,
     ) {
         self.flush_pending_page_flip(window, cx);
-        if self.reader_pagination == ReaderPaginationPref::Page {
-            let step = if use_two_col { 2isize } else { 1isize };
-            let can_retreat = self
-                .reader
-                .as_ref()
-                .is_some_and(|r| r.current_page > 0 || r.chapter_idx > 0);
-            let vp_w = self
-                .reader
-                .as_ref()
-                .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
-                .unwrap_or(360.0);
-            if can_retreat {
-                let sx = start_x.unwrap_or(0.0);
-                let dur = if sx.abs() > 1.0 { 175 } else { 210 };
-                self.reader_start_page_flip_anim(sx, vp_w, -1, -step, dur, cx);
-            } else if let Some(sx) = start_x
-                && sx.abs() > 1.0
-            {
-                self.reader_start_page_flip_anim(sx, 0.0, 0, 0, 160, cx);
-            }
-            return;
-        }
-        if let Some(r) = &self.reader
-            && r.chapter_idx > 0
+        let step = if use_two_col { 2isize } else { 1isize };
+        let can_retreat = self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.current_page > 0 || r.chapter_idx > 0);
+        let vp_w = self
+            .reader
+            .as_ref()
+            .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
+            .unwrap_or(360.0);
+        if can_retreat {
+            let sx = start_x.unwrap_or(0.0);
+            let dur = if sx.abs() > 1.0 { 175 } else { 210 };
+            self.reader_start_page_flip_anim(sx, vp_w, -1, -step, dur, cx);
+        } else if let Some(sx) = start_x
+            && sx.abs() > 1.0
         {
-            let prev_ch = r.chapter_idx - 1;
-            let vp_w = f32::from(r.viewport_bounds.get().size.width).max(320.0);
-            self.reader_go_chapter(prev_ch, window, cx);
-            self.reader_start_page_flip_anim(start_x.unwrap_or(-vp_w * 0.42), 0.0, -1, 0, 200, cx);
+            self.reader_start_page_flip_anim(sx, 0.0, 0, 0, 160, cx);
         }
     }
 
@@ -1952,132 +1954,6 @@ impl BookwormMobileApp {
                     app.persist_reader_progress(cur_now, cx);
                 }
             });
-        })
-        .detach();
-    }
-
-    fn apply_pending_reader_scroll(&mut self) -> bool {
-        if self.reader_pagination == ReaderPaginationPref::Page {
-            return true;
-        }
-        let Some(r) = &mut self.reader else {
-            return true;
-        };
-        if r.pending_scroll_block.is_none() && r.pending_scroll_fraction.is_none() {
-            return true;
-        }
-        if r.show_toc || r.show_notes {
-            return false;
-        }
-        let scroll_bounds = self.reader_scroll.bounds();
-        let vp_h = f32::from(scroll_bounds.size.height);
-        let ch_has_text = r.book.chapters.get(r.chapter_idx).is_some_and(|c| {
-            c.blocks.iter().any(|b| {
-                matches!(
-                    b,
-                    EpubBlock::Heading { .. }
-                        | EpubBlock::Paragraph { .. }
-                        | EpubBlock::ListItem { .. }
-                )
-            })
-        });
-        if vp_h <= 0.0 || (ch_has_text && r.rendered_layouts.borrow().is_empty()) {
-            return false;
-        }
-
-        let max_y = f32::from(self.reader_scroll.max_offset().y);
-        if let Some((target_blk, target_byte)) = r.pending_scroll_block {
-            let layouts = r.rendered_layouts.borrow();
-            if let Some((_, base, len, layout)) = layouts.iter().find(|(b, _, _, _)| *b == target_blk) {
-                let win_y = if target_byte > *base {
-                    layout
-                        .position_for_index(target_byte.saturating_sub(*base).min(*len))
-                        .map(|p| f32::from(p.y))
-                        .unwrap_or_else(|| f32::from(layout.bounds().origin.y))
-                } else {
-                    f32::from(layout.bounds().origin.y)
-                };
-                let cur_off_y = f32::from(self.reader_scroll.offset().y);
-                let vp_top_y = f32::from(scroll_bounds.top());
-                let top_margin = (vp_h * 0.12).clamp(24.0, 56.0);
-                let target_y = Self::compute_block_scroll_target_y(
-                    win_y,
-                    vp_top_y,
-                    cur_off_y,
-                    max_y,
-                    top_margin,
-                );
-                drop(layouts);
-                r.pending_scroll_block = None;
-                r.pending_scroll_fraction = None;
-                if max_y > 0.0 {
-                    self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
-                }
-                if let Some(r) = &mut self.reader {
-                    r.last_saved_scroll_pct = if max_y > 0.0 {
-                        (target_y / max_y).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                }
-                return true;
-            }
-            drop(layouts);
-            r.pending_scroll_block = None;
-        }
-
-        if let Some(frac) = r.pending_scroll_fraction.take() {
-            let clamped = frac.clamp(0.0, 1.0);
-            let target_y = if max_y > 0.0 {
-                (clamped * max_y).clamp(0.0, max_y)
-            } else {
-                0.0
-            };
-            if max_y > 0.0 {
-                self.reader_scroll.set_offset(point(px(0.), px(-target_y)));
-            }
-            if let Some(r) = &mut self.reader {
-                r.last_saved_scroll_pct = clamped;
-            }
-        }
-        true
-    }
-
-    fn schedule_pending_reader_scroll(&mut self, cx: &mut Context<Self>) {
-        let Some(r) = &mut self.reader else {
-            return;
-        };
-        r.scroll_jump_gen = r.scroll_jump_gen.wrapping_add(1);
-        let book_rel = r.book_rel.clone();
-        let jump_gen = r.scroll_jump_gen;
-        cx.spawn(async move |this, cx| {
-            for delay_ms in [16u64, 32, 64, 128, 250] {
-                cx.background_executor()
-                    .timer(Duration::from_millis(delay_ms))
-                    .await;
-                let mut stop = false;
-                let updated = this.update(cx, |app, cx| {
-                    let matches_jump = app
-                        .reader
-                        .as_ref()
-                        .is_some_and(|r| r.book_rel == book_rel && r.scroll_jump_gen == jump_gen);
-                    if !matches_jump {
-                        stop = true;
-                        return;
-                    }
-                    if app.apply_pending_reader_scroll() {
-                        let pct = app.reader_current_scroll_pct();
-                        app.persist_reader_progress(pct, cx);
-                        cx.notify();
-                        stop = true;
-                    } else {
-                        cx.notify();
-                    }
-                });
-                if updated.is_err() || stop {
-                    break;
-                }
-            }
         })
         .detach();
     }
@@ -2166,7 +2042,6 @@ impl BookwormMobileApp {
                     ));
                 }
 
-                app.reader_scroll.set_offset(point(px(0.), px(0.)));
                 app.notes_scroll.set_offset(point(px(0.), px(0.)));
                 window.blur(cx);
                 gpui_mobile::hide_keyboard();
@@ -2181,6 +2056,7 @@ impl BookwormMobileApp {
                     show_settings: false,
                     show_toc: false,
                     show_notes: open_notes,
+                    zen_mode: false,
                     notes_color_filter: None,
                     notes_only_filter: false,
                     draft: None,
@@ -2219,13 +2095,9 @@ impl BookwormMobileApp {
                     decoded_images: RefCell::new(HashMap::new()),
                     pending_scroll_block: None,
                     pending_scroll_fraction,
-                    scroll_jump_gen: 0,
                     last_saved_scroll_pct: restored_scroll,
                     scroll_save_scheduled: false,
                 });
-                if pending_scroll_fraction.is_some() {
-                    app.schedule_pending_reader_scroll(cx);
-                }
                 app.surface = AppSurface::Reader;
                 app.schedule_library_sync_save(false, cx);
                 cx.notify();
@@ -2251,8 +2123,6 @@ impl BookwormMobileApp {
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = None;
-            r.scroll_jump_gen = r.scroll_jump_gen.wrapping_add(1);
-            self.reader_scroll.set_offset(point(px(0.), px(0.)));
             self.persist_reader_progress(0.0, cx);
             window.blur(cx);
             gpui_mobile::hide_keyboard();
@@ -2286,11 +2156,7 @@ impl BookwormMobileApp {
             r.pending_scroll_block = Some((hl.start_block, hl.start_offset));
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
-            self.reader_scroll.set_offset(point(px(0.), px(0.)));
             self.persist_reader_progress(frac, cx);
-            if self.reader_pagination != ReaderPaginationPref::Page {
-                self.schedule_pending_reader_scroll(cx);
-            }
             window.blur(cx);
             gpui_mobile::hide_keyboard();
         }
@@ -2317,11 +2183,7 @@ impl BookwormMobileApp {
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
-            self.reader_scroll.set_offset(point(px(0.), px(0.)));
             self.persist_reader_progress(frac, cx);
-            if self.reader_pagination != ReaderPaginationPref::Page {
-                self.schedule_pending_reader_scroll(cx);
-            }
             window.blur(cx);
             gpui_mobile::hide_keyboard();
         }
@@ -2531,24 +2393,19 @@ impl BookwormMobileApp {
         cx.notify();
     }
 
-    pub fn toggle_reader_pagination(&mut self, cx: &mut Context<Self>) {
-        let frac = self.reader_current_scroll_pct();
-        self.reader_pagination = self.reader_pagination.toggle();
-        self.library_store.reader_prefs.pagination = self.reader_pagination;
-        if let Some(r) = &mut self.reader {
-            r.flip_anim = None;
-            r.swipe_offset_x = 0.0;
-            r.swipe_active = false;
-            r.page_touch_mode = None;
+    pub fn set_reader_zen_mode(&mut self, zen: bool, cx: &mut Context<Self>) {
+        if let Some(r) = &mut self.reader
+            && r.zen_mode != zen
+        {
+            r.zen_mode = zen;
+            if zen {
+                r.show_settings = false;
+                r.show_toc = false;
+                r.show_notes = false;
+            }
             r.needs_page_recompute = true;
-            r.pending_last_page = false;
-            r.pending_scroll_fraction = Some(frac);
+            cx.notify();
         }
-        if self.reader_pagination == ReaderPaginationPref::Scroll {
-            self.schedule_pending_reader_scroll(cx);
-        }
-        self.schedule_library_sync_save(false, cx);
-        cx.notify();
     }
 
     pub fn toggle_two_column_spread(&mut self, cx: &mut Context<Self>) {
@@ -2650,6 +2507,9 @@ impl Render for BookwormMobileApp {
                             .flex_col()
                             .child(body),
                     )
+                    .when(self.surface == AppSurface::Library && self.library_drawer_open, |frame| {
+                        frame.child(library_view::render_library_drawer(self, window, cx))
+                    })
                     .when(self.book_context_menu.is_some(), |frame| {
                         frame.child(library_view::render_book_context_menu(self, cx))
                     })

@@ -101,12 +101,46 @@ impl LibraryGridSize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LibrarySort {
+    #[default]
+    Recent,
+    Title,
+    Author,
+    Progress,
+}
+
+impl LibrarySort {
+    pub fn all() -> &'static [LibrarySort] {
+        &[Self::Recent, Self::Title, Self::Author, Self::Progress]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "Recently Read",
+            Self::Title => "Title",
+            Self::Author => "Author",
+            Self::Progress => "Progress",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Title => "title",
+            Self::Author => "author",
+            Self::Progress => "progress",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BookwormMobileConfig {
     pub books_root: Option<PathBuf>,
     pub two_column_spread: bool,
     pub library_grid_size: LibraryGridSize,
+    pub library_sort: LibrarySort,
 }
 
 impl Default for BookwormMobileConfig {
@@ -115,6 +149,7 @@ impl Default for BookwormMobileConfig {
             books_root: None,
             two_column_spread: true,
             library_grid_size: LibraryGridSize::Medium,
+            library_sort: LibrarySort::Recent,
         }
     }
 }
@@ -151,11 +186,13 @@ mod tests {
             books_root: Some(PathBuf::from("/sdcard/Documents/Library")),
             two_column_spread: false,
             library_grid_size: LibraryGridSize::Large,
+            library_sort: LibrarySort::Title,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: BookwormMobileConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.books_root, cfg.books_root);
         assert!(!back.two_column_spread);
         assert_eq!(back.library_grid_size, LibraryGridSize::Large);
+        assert_eq!(back.library_sort, LibrarySort::Title);
     }
 }

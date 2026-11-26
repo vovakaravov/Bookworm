@@ -335,8 +335,8 @@ impl ReaderWidthPref {
 #[serde(rename_all = "snake_case")]
 pub enum ReaderPaginationPref {
     #[default]
-    Scroll,
     Page,
+    Scroll,
 }
 
 impl ReaderPaginationPref {
@@ -679,7 +679,7 @@ impl Default for ReaderPrefs {
             font: ReaderFontPref::Serif,
             width: ReaderWidthPref::Standard,
             spacing: ReaderSpacingPref::Normal,
-            pagination: ReaderPaginationPref::Scroll,
+            pagination: ReaderPaginationPref::Page,
             last_highlight_color: HighlightColor::Yellow,
             last_highlight_style: HighlightDecoration::Highlight,
         }
@@ -2165,7 +2165,7 @@ mod tests {
         let legacy = r#"{"font_size":18.0,"theme":"sepia","width":"standard"}"#;
         let prefs: ReaderPrefs = serde_json::from_str(legacy).unwrap();
         assert_eq!(prefs.width, ReaderWidthPref::Standard);
-        assert_eq!(prefs.pagination, ReaderPaginationPref::Scroll);
+        assert_eq!(prefs.pagination, ReaderPaginationPref::Page);
         assert_eq!(ReaderWidthPref::Full.max_width_px_opt(), None);
     }
 

@@ -42,6 +42,7 @@ actions!(
         ToggleOutline,
         OpenFolderDialog,
         EscapeModal,
+        ToggleZenMode,
     ]
 );
 
@@ -54,6 +55,8 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-b", ToggleOutline, None),
         KeyBinding::new("ctrl-shift-o", OpenFolderDialog, None),
         KeyBinding::new("escape", EscapeModal, None),
+        KeyBinding::new("f11", ToggleZenMode, None),
+        KeyBinding::new("ctrl-alt-z", ToggleZenMode, None),
     ]);
 }
 
@@ -119,6 +122,7 @@ pub struct BookwormApp {
     pub tabs: Vec<BookTab>,
     /// `None` = pinned Library tab (Tab 0); `Some(idx)` = open Book tab index.
     pub active_tab: Option<usize>,
+    pub zen_mode: bool,
     pub outline_scroll: ScrollHandle,
     focus_handle: FocusHandle,
     toast: Option<(String, bool)>,
@@ -182,6 +186,7 @@ impl BookwormApp {
             _library_sub: library_sub,
             tabs: Vec::new(),
             active_tab: None,
+            zen_mode: false,
             outline_scroll: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             toast: None,
@@ -491,8 +496,56 @@ impl BookwormApp {
             Some(cur) if cur > idx => Some(cur - 1),
             Some(cur) => Some(cur),
         };
+        if self.active_tab.is_none() {
+            self.exit_zen_mode(window, cx);
+        } else {
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn enter_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_idx) = self.active_tab else {
+            return;
+        };
+        let Some(view) = self.tabs.get(active_idx).and_then(|t| t.view.clone()) else {
+            return;
+        };
+        self.zen_mode = true;
+        view.update(cx, |v, cx| v.set_zen_mode(true, cx));
         self.focus_active_surface(window, cx);
         cx.notify();
+    }
+
+    pub fn exit_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.zen_mode {
+            return;
+        }
+        self.zen_mode = false;
+        for tab in &self.tabs {
+            if let Some(view) = &tab.view {
+                view.update(cx, |v, cx| v.set_zen_mode(false, cx));
+            }
+        }
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.zen_mode {
+            self.exit_zen_mode(window, cx);
+        } else {
+            self.enter_zen_mode(window, cx);
+        }
+    }
+
+    fn handle_toggle_zen_mode(
+        &mut self,
+        _: &ToggleZenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_zen_mode(window, cx);
     }
 
     fn reorder_tab(
@@ -673,6 +726,10 @@ impl BookwormApp {
             && view.read(cx).is_find_open()
         {
             view.update(cx, |v, cx| v.close_find(Some(window), cx));
+            return;
+        }
+        if self.zen_mode {
+            self.exit_zen_mode(window, cx);
         }
     }
 
@@ -923,6 +980,7 @@ impl Render for BookwormApp {
                             .hover(move |s| if lib_selected { s } else { s.bg(sidebar_bg) })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.active_tab = None;
+                                this.exit_zen_mode(window, cx);
                                 this.focus_active_surface(window, cx);
                                 cx.notify();
                             }))
@@ -1006,6 +1064,108 @@ impl Render for BookwormApp {
                     }),
             );
 
+        let zen_view = if self.zen_mode {
+            self.active_tab
+                .and_then(|i| self.tabs.get(i))
+                .and_then(|t| t.view.clone())
+        } else {
+            None
+        };
+
+        if let Some(view) = zen_view {
+            let loc = view.read(cx).global_location();
+            let zen_meta = format!("Page {}/{} · {}%", loc.page, loc.total_pages, loc.progress_pct);
+
+            let zen_exit_overlay = div()
+                .id("bw-zen-exit-zone")
+                .group("bw-zen-exit-zone")
+                .absolute()
+                .bottom_0()
+                .right_0()
+                .w(px(236.))
+                .h(px(76.))
+                .p_4()
+                .flex()
+                .items_end()
+                .justify_end()
+                .child(
+                    div()
+                        .id("bw-zen-exit-reveal")
+                        .opacity(0.)
+                        .group_hover("bw-zen-exit-zone", |s| s.opacity(1.))
+                        .child(
+                            div()
+                                .id("bw-zen-exit-btn")
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(8.))
+                                .bg(sidebar_bg)
+                                .border_1()
+                                .border_color(border)
+                                .shadow_md()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .hover(move |s| s.bg(panel_bg).border_color(green))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.exit_zen_mode(window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(zen_meta),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(border)
+                                        .child("·"),
+                                )
+                                .child(
+                                    Icon::new(IconName::Minimize2)
+                                        .xsmall()
+                                        .text_color(fg),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(fg)
+                                        .child("Exit Zen"),
+                                )
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(deep_bg)
+                                        .text_size(px(10.))
+                                        .text_color(muted)
+                                        .child("F11"),
+                                ),
+                        ),
+                );
+
+            return v_flex()
+                .id("bookworm-app-root")
+                .relative()
+                .size_full()
+                .bg(main_bg)
+                .track_focus(&self.focus_handle)
+                .on_action(cx.listener(Self::handle_find_in_tab))
+                .on_action(cx.listener(Self::handle_close_tab))
+                .on_action(cx.listener(Self::handle_next_tab))
+                .on_action(cx.listener(Self::handle_prev_tab))
+                .on_action(cx.listener(Self::handle_toggle_outline))
+                .on_action(cx.listener(Self::handle_open_folder_dialog))
+                .on_action(cx.listener(Self::handle_escape))
+                .on_action(cx.listener(Self::handle_toggle_zen_mode))
+                .child(div().flex_1().min_h_0().w_full().child(view))
+                .child(zen_exit_overlay)
+                .into_any_element();
+        }
+
         let body: AnyElement = if let Some(active_idx) = self.active_tab
             && let Some(tab) = self.tabs.get(active_idx)
         {
@@ -1081,8 +1241,10 @@ impl Render for BookwormApp {
             .on_action(cx.listener(Self::handle_toggle_outline))
             .on_action(cx.listener(Self::handle_open_folder_dialog))
             .on_action(cx.listener(Self::handle_escape))
+            .on_action(cx.listener(Self::handle_toggle_zen_mode))
             .child(top_bar)
             .child(body)
             .when_some(toast_el, |col, t| col.child(t))
+            .into_any_element()
     }
 }

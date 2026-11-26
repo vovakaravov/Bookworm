@@ -1,5 +1,5 @@
 use super::{BookwormMobileApp, LibraryFilter};
-use crate::config::LibraryGridSize;
+use crate::config::{LibraryGridSize, LibrarySort};
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use bookworm_core::library::{BookRecord, ReadingStatus};
 use gpui::{prelude::*, *};
@@ -7,6 +7,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -570,7 +571,7 @@ pub fn render_library_tab(
         .value()
         .trim()
         .to_lowercase();
-    let filtered: Vec<&BookRecord> = app
+    let mut filtered: Vec<&BookRecord> = app
         .books
         .iter()
         .filter(|b| {
@@ -583,6 +584,11 @@ pub fn render_library_tab(
             if !status_ok {
                 return false;
             }
+            if let Some(shelf) = &app.library_shelf_filter
+                && !b.all_tags().iter().any(|t| t == shelf)
+            {
+                return false;
+            }
             if q.is_empty() {
                 return true;
             }
@@ -592,7 +598,43 @@ pub fn render_library_tab(
         })
         .collect();
 
-    let continue_book = if q.is_empty() && app.library_filter == LibraryFilter::All {
+    filtered.sort_by(|a, b| match app.library_sort {
+        LibrarySort::Recent => {
+            let ta = a.user.last_opened.as_deref().unwrap_or("");
+            let tb = b.user.last_opened.as_deref().unwrap_or("");
+            tb.cmp(ta).then_with(|| {
+                a.display_title()
+                    .to_lowercase()
+                    .cmp(&b.display_title().to_lowercase())
+            })
+        }
+        LibrarySort::Title => a
+            .display_title()
+            .to_lowercase()
+            .cmp(&b.display_title().to_lowercase()),
+        LibrarySort::Author => a
+            .authors_display()
+            .to_lowercase()
+            .cmp(&b.authors_display().to_lowercase())
+            .then_with(|| {
+                a.display_title()
+                    .to_lowercase()
+                    .cmp(&b.display_title().to_lowercase())
+            }),
+        LibrarySort::Progress => b
+            .progress_pct()
+            .cmp(&a.progress_pct())
+            .then_with(|| {
+                let ta = a.user.last_opened.as_deref().unwrap_or("");
+                let tb = b.user.last_opened.as_deref().unwrap_or("");
+                tb.cmp(ta)
+            }),
+    });
+
+    let continue_book = if q.is_empty()
+        && app.library_filter == LibraryFilter::All
+        && app.library_shelf_filter.is_none()
+    {
         app.most_recent_in_progress_book().cloned()
     } else {
         None
@@ -624,20 +666,13 @@ pub fn render_library_tab(
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(
-                    div()
-                        .w(px(30.))
-                        .h(px(30.))
-                        .rounded(px(8.))
-                        .bg(hex_alpha(0x87a98728))
-                        .border_1()
-                        .border_color(hex_color(kd::GREEN))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .child(lib_icon(IconName::BookOpen, 15., kd::GREEN)),
-                )
+                .child(lib_header_icon_btn(
+                    "lib-drawer-btn",
+                    IconName::Menu,
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle_library_drawer(!this.library_drawer_open, window, cx);
+                    }),
+                ))
                 .child(
                     v_flex()
                         .flex_1()
@@ -769,7 +804,34 @@ pub fn render_library_tab(
                                 .child(sz.short_label())
                         })),
                 ),
-        );
+        )
+        .when_some(app.library_shelf_filter.clone(), |col, shelf| {
+            col.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("lib-active-shelf-chip")
+                            .px_2p5()
+                            .py_1()
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .bg(accent_alpha(0x28))
+                            .border_1()
+                            .border_color(accent_alpha(0x80))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hex_color(kd::ACCENT_HOVER))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_library_shelf_filter(None, cx);
+                            }))
+                            .child(format!("Shelf: {shelf}  ×")),
+                    ),
+            )
+        });
 
     let grid = if filtered.is_empty() {
         div()
@@ -1168,6 +1230,364 @@ pub fn render_book_context_menu(
         )
         .with_animation(
             "book-ctx-fade",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
+        )
+        .into_any_element()
+}
+
+pub fn render_library_drawer(
+    app: &BookwormMobileApp,
+    _window: &Window,
+    cx: &mut Context<BookwormMobileApp>,
+) -> impl IntoElement {
+    let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for book in &app.books {
+        for tag in book.all_tags() {
+            *tag_counts.entry(tag).or_insert(0) += 1;
+        }
+    }
+
+    let current_sort = app.library_sort;
+    let active_shelf = app.library_shelf_filter.clone();
+    let total_books = app.books.len();
+
+    let section_label = |label: &'static str| {
+        div()
+            .px_1()
+            .pt_1()
+            .text_size(px(10.5))
+            .font_weight(FontWeight::BOLD)
+            .text_color(hex_color(kd::FG_SUBTLE))
+            .child(label)
+    };
+
+    div()
+        .id("lib-drawer-scrim")
+        .absolute()
+        .inset_0()
+        .bg(hex_alpha(0x00000090))
+        .occlude()
+        .flex()
+        .flex_row()
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.toggle_library_drawer(false, window, cx);
+        }))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .child(
+            v_flex()
+                .id("lib-drawer-panel")
+                .w(px(284.))
+                .max_w(px(300.))
+                .h_full()
+                .bg(hex_color(kd::BG_DEEP))
+                .border_r_1()
+                .border_color(hex_color(kd::BORDER))
+                .shadow_xl()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_2p5()
+                        .items_center()
+                        .justify_between()
+                        .bg(hex_color(kd::BG_SIDEBAR))
+                        .border_b_1()
+                        .border_color(hex_color(kd::BORDER_SUBTLE))
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(hex_color(kd::FG))
+                                        .child("Bookworm"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(hex_color(kd::FG_SUBTLE))
+                                        .child(format!("{total_books} books")),
+                                ),
+                        )
+                        .child(lib_header_icon_btn(
+                            "lib-drawer-close",
+                            IconName::Close,
+                            cx.listener(|this, _, window, cx| {
+                                this.toggle_library_drawer(false, window, cx);
+                            }),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("lib-drawer-scroll")
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&app.library_drawer_scroll)
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .p_3()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(section_label("SORT BY"))
+                                        .children(LibrarySort::all().iter().copied().map(
+                                            |sort_opt| {
+                                                let active = current_sort == sort_opt;
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "lib-drawer-sort-{}",
+                                                        sort_opt.key()
+                                                    )))
+                                                    .w_full()
+                                                    .px_2p5()
+                                                    .py_2()
+                                                    .rounded(px(8.))
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .bg(if active {
+                                                        accent_alpha(0x28)
+                                                    } else {
+                                                        hex_color(kd::BG_PANEL)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if active {
+                                                        accent_alpha(0x88)
+                                                    } else {
+                                                        hex_color(kd::BORDER_SUBTLE)
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.set_library_sort(sort_opt, cx);
+                                                            this.toggle_library_drawer(
+                                                                false, window, cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(if active {
+                                                                FontWeight::SEMIBOLD
+                                                            } else {
+                                                                FontWeight::MEDIUM
+                                                            })
+                                                            .text_color(hex_color(if active {
+                                                                kd::ACCENT_HOVER
+                                                            } else {
+                                                                kd::FG
+                                                            }))
+                                                            .child(sort_opt.label()),
+                                                    )
+                                                    .when(active, |row| {
+                                                        row.child(lib_icon(
+                                                            IconName::Check,
+                                                            13.,
+                                                            kd::ACCENT_HOVER,
+                                                        ))
+                                                    })
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(section_label("SHELVES & TAGS"))
+                                        .child(
+                                            div()
+                                                .id("lib-drawer-shelf-all")
+                                                .w_full()
+                                                .px_2p5()
+                                                .py_2()
+                                                .rounded(px(8.))
+                                                .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .bg(if active_shelf.is_none() {
+                                                    hex_color(kd::GREEN)
+                                                } else {
+                                                    hex_color(kd::BG_PANEL)
+                                                })
+                                                .border_1()
+                                                .border_color(if active_shelf.is_none() {
+                                                    hex_color(kd::GREEN)
+                                                } else {
+                                                    hex_color(kd::BORDER_SUBTLE)
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.set_library_shelf_filter(None, cx);
+                                                    this.toggle_library_drawer(false, window, cx);
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(hex_color(
+                                                            if active_shelf.is_none() {
+                                                                kd::BG_MAIN
+                                                            } else {
+                                                                kd::FG
+                                                            },
+                                                        ))
+                                                        .child("All Books"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.5))
+                                                        .text_color(hex_color(
+                                                            if active_shelf.is_none() {
+                                                                kd::BG_MAIN
+                                                            } else {
+                                                                kd::FG_SUBTLE
+                                                            },
+                                                        ))
+                                                        .child(format!("{total_books}")),
+                                                ),
+                                        )
+                                        .when(tag_counts.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .text_size(px(11.))
+                                                    .text_color(hex_color(kd::FG_SUBTLE))
+                                                    .child("No tags yet — long-press any book or edit metadata."),
+                                            )
+                                        })
+                                        .children(tag_counts.into_iter().enumerate().map(
+                                            |(ix, (tag, count))| {
+                                                let is_active =
+                                                    active_shelf.as_deref() == Some(tag.as_str());
+                                                let tag_click = tag.clone();
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "lib-drawer-tag-{ix}"
+                                                    )))
+                                                    .w_full()
+                                                    .px_2p5()
+                                                    .py_2()
+                                                    .rounded(px(8.))
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .bg(if is_active {
+                                                        accent_alpha(0x28)
+                                                    } else {
+                                                        hex_color(kd::BG_PANEL)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if is_active {
+                                                        accent_alpha(0x88)
+                                                    } else {
+                                                        hex_color(kd::BORDER_SUBTLE)
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.set_library_shelf_filter(
+                                                                Some(tag_click.clone()),
+                                                                cx,
+                                                            );
+                                                            this.toggle_library_drawer(
+                                                                false, window, cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .truncate()
+                                                            .text_color(hex_color(if is_active {
+                                                                kd::ACCENT_HOVER
+                                                            } else {
+                                                                kd::FG
+                                                            }))
+                                                            .child(tag),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .text_color(hex_color(kd::FG_SUBTLE))
+                                                            .child(format!("{count}")),
+                                                    )
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1p5()
+                                        .child(section_label("ACTIONS"))
+                                        .child(
+                                            Button::new("lib-drawer-pick-root")
+                                                .secondary()
+                                                .small()
+                                                .w_full()
+                                                .icon(IconName::Folder)
+                                                .label("Choose Books Folder")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.toggle_library_drawer(false, window, cx);
+                                                    this.open_folder_picker(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("lib-drawer-export-md")
+                                                .secondary()
+                                                .small()
+                                                .w_full()
+                                                .icon(IconName::BookOpen)
+                                                .label("Export Highlights (.md)")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.toggle_library_drawer(false, window, cx);
+                                                    this.export_notes_to_markdown(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("lib-drawer-sample")
+                                                .secondary()
+                                                .small()
+                                                .w_full()
+                                                .label("Create Sample EPUB")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.toggle_library_drawer(false, window, cx);
+                                                    this.create_sample_book(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("lib-drawer-settings")
+                                                .secondary()
+                                                .small()
+                                                .w_full()
+                                                .icon(IconName::Settings)
+                                                .label("Settings")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.toggle_library_drawer(false, window, cx);
+                                                    this.open_surface_settings(window, cx);
+                                                })),
+                                        ),
+                                )
+                                .child(div().w_full().h(px(app.safe_area.bottom))),
+                        ),
+                )
+                .with_animation(
+                    "lib-drawer-slide",
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+                    |el, t| el.ml(px(-284.0 * (1.0 - t))).opacity(t),
+                ),
+        )
+        .with_animation(
+            "lib-drawer-scrim-fade",
             Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
             |el, t| el.opacity(t),
         )

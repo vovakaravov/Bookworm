@@ -30,6 +30,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum EpubViewEvent {
@@ -92,6 +93,7 @@ pub struct EpubView {
     pub chapter_cum_weights: Vec<f32>,
     pub chapter_idx: usize,
     pub prefs: ReaderPrefs,
+    pub zen_mode: bool,
     pub is_finished: bool,
     pub bookmarks: Vec<BookBookmark>,
     pub highlights: Vec<BookHighlight>,
@@ -100,7 +102,6 @@ pub struct EpubView {
     annotations_color_filter: Option<HighlightColor>,
     annotations_notes_only: bool,
     focus_handle: FocusHandle,
-    scroll_handle: ScrollHandle,
     annotations_hl_scroll: ScrollHandle,
     annotations_bm_scroll: ScrollHandle,
     viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -375,14 +376,17 @@ impl EpubView {
         } else {
             None
         };
+        let mut prefs = prefs;
+        prefs.pagination = ReaderPaginationPref::Page;
 
-        let mut view = Self {
+        Self {
             path,
             rel_path,
             book,
             chapter_cum_weights,
             chapter_idx: initial_ch,
             prefs,
+            zen_mode: false,
             is_finished: user_state.status == ReadingStatus::Finished,
             bookmarks: user_state.bookmarks,
             highlights: user_state.highlights,
@@ -391,7 +395,6 @@ impl EpubView {
             annotations_color_filter: None,
             annotations_notes_only: false,
             focus_handle: cx.focus_handle(),
-            scroll_handle: ScrollHandle::new(),
             annotations_hl_scroll: ScrollHandle::new(),
             annotations_bm_scroll: ScrollHandle::new(),
             viewport_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -429,13 +432,7 @@ impl EpubView {
             needs_page_recompute: true,
             last_wheel_page_at: None,
             decoded_images: RefCell::new(HashMap::new()),
-        };
-        if view.pending_scroll_fraction.is_some()
-            && view.prefs.pagination == ReaderPaginationPref::Scroll
-        {
-            view.schedule_pending_scroll(cx);
         }
-        view
     }
 
     pub fn reload_book(&mut self, book: EpubBook, cx: &mut Context<Self>) {
@@ -460,31 +457,33 @@ impl EpubView {
         self.rel_path = new_rel_path;
     }
 
-    pub fn apply_prefs(&mut self, prefs: ReaderPrefs, cx: &mut Context<Self>) {
+    pub fn set_zen_mode(&mut self, zen: bool, cx: &mut Context<Self>) {
+        if self.zen_mode != zen {
+            self.zen_mode = zen;
+            self.needs_page_recompute = true;
+            cx.notify();
+        }
+    }
+
+    pub fn apply_prefs(&mut self, mut prefs: ReaderPrefs, cx: &mut Context<Self>) {
+        prefs.pagination = ReaderPaginationPref::Page;
         if self.prefs != prefs {
             self.prefs = prefs;
+            self.needs_page_recompute = true;
             cx.notify();
         }
     }
 
     pub fn current_scroll_pct(&self) -> f32 {
-        if self.prefs.pagination == ReaderPaginationPref::Page {
-            let tp = self.chapter_pages.len().max(1);
-            if tp <= 1 {
-                return if self.chapter_idx + 1 >= self.book.chapters.len() {
-                    1.0
-                } else {
-                    0.0
-                };
-            }
-            return (self.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0);
+        let tp = self.chapter_pages.len().max(1);
+        if tp <= 1 {
+            return if self.chapter_idx + 1 >= self.book.chapters.len() {
+                1.0
+            } else {
+                0.0
+            };
         }
-        let max_y = f32::from(self.scroll_handle.max_offset().y);
-        if max_y <= 1.0 {
-            return 0.0;
-        }
-        let off_y = -f32::from(self.scroll_handle.offset().y);
-        (off_y / max_y).clamp(0.0, 1.0)
+        (self.current_page.min(tp - 1) as f32 / (tp - 1) as f32).clamp(0.0, 1.0)
     }
 
     fn shape_block_line_ranges(
@@ -595,16 +594,13 @@ impl EpubView {
         reader_font: SharedString,
         window: &Window,
     ) {
-        if self.prefs.pagination != ReaderPaginationPref::Page || vp_w < 160.0 || vp_h < 220.0 {
-            return;
-        }
-        if self.pages_cache_key.is_some() && self.is_dragging_selection {
-            return;
-        }
         let two_col = self.prefs.width == ReaderWidthPref::TwoColumn;
         let ch_idx = self
             .chapter_idx
             .min(self.book.chapters.len().saturating_sub(1));
+        if vp_w < 160.0 || vp_h < 220.0 {
+            return;
+        }
         let key = (
             ch_idx,
             vp_w.round() as u32,
@@ -787,40 +783,36 @@ impl EpubView {
     }
 
     pub fn next_page_or_chapter(&mut self, cx: &mut Context<Self>) {
-        if self.prefs.pagination == ReaderPaginationPref::Page {
-            let step = if self.prefs.width == ReaderWidthPref::TwoColumn {
-                2usize
-            } else {
-                1usize
-            };
-            let count = self.chapter_pages.len();
-            if self.current_page + step < count {
-                self.go_to_page(self.current_page + step, cx);
-                return;
-            }
+        let step = if self.prefs.width == ReaderWidthPref::TwoColumn {
+            2usize
+        } else {
+            1usize
+        };
+        let count = self.chapter_pages.len();
+        if self.current_page + step < count {
+            self.go_to_page(self.current_page + step, cx);
+            return;
         }
         self.next_chapter(cx);
     }
 
     pub fn prev_page_or_chapter(&mut self, cx: &mut Context<Self>) {
-        if self.prefs.pagination == ReaderPaginationPref::Page {
-            let step = if self.prefs.width == ReaderWidthPref::TwoColumn {
-                2usize
-            } else {
-                1usize
-            };
-            if self.current_page >= step {
-                self.go_to_page(self.current_page - step, cx);
-                return;
-            } else if self.current_page > 0 {
-                self.go_to_page(0, cx);
-                return;
-            }
-            if self.chapter_idx > 0 {
-                self.pending_last_page = true;
-                self.go_to_chapter(self.chapter_idx - 1, cx);
-                return;
-            }
+        let step = if self.prefs.width == ReaderWidthPref::TwoColumn {
+            2usize
+        } else {
+            1usize
+        };
+        if self.current_page >= step {
+            self.go_to_page(self.current_page - step, cx);
+            return;
+        } else if self.current_page > 0 {
+            self.go_to_page(0, cx);
+            return;
+        }
+        if self.chapter_idx > 0 {
+            self.pending_last_page = true;
+            self.go_to_chapter(self.chapter_idx - 1, cx);
+            return;
         }
         self.prev_chapter(cx);
     }
@@ -1208,19 +1200,14 @@ impl EpubView {
             self.rendered_layouts.borrow_mut().clear();
             self.clear_selection_and_popup();
             self.chapter_idx = target_ch;
-            self.scroll_handle.set_offset(point(px(0.), px(0.)));
+            self.current_page = 0;
+            self.needs_page_recompute = true;
             self.last_reported_scroll_pct = frac;
             self.emit_progress(false, cx);
         }
         self.pending_scroll_block = Some((hl.start_block, hl.start_offset));
         self.pending_scroll_fraction = Some(frac);
-        if self.prefs.pagination == ReaderPaginationPref::Scroll
-            && (switched || !self.apply_pending_scroll())
-        {
-            self.schedule_pending_scroll(cx);
-        } else if self.prefs.pagination == ReaderPaginationPref::Scroll {
-            self.emit_progress(false, cx);
-        }
+        self.needs_page_recompute = true;
         cx.notify();
     }
 
@@ -1248,20 +1235,6 @@ impl EpubView {
         self.rendered_layouts.borrow_mut().clear();
         self.prefs.width = self.prefs.width.next();
         self.needs_page_recompute = true;
-        self.emit_prefs(cx);
-        cx.notify();
-    }
-
-    pub fn toggle_pagination(&mut self, cx: &mut Context<Self>) {
-        let frac = self.current_scroll_pct();
-        self.prefs.pagination = self.prefs.pagination.toggle();
-        self.needs_page_recompute = true;
-        self.pending_last_page = false;
-        self.pending_scroll_fraction = Some(frac);
-        if self.prefs.pagination == ReaderPaginationPref::Scroll {
-            self.scroll_handle.set_offset(point(px(0.), px(0.)));
-            self.schedule_pending_scroll(cx);
-        }
         self.emit_prefs(cx);
         cx.notify();
     }
@@ -1353,19 +1326,14 @@ impl EpubView {
             self.rendered_layouts.borrow_mut().clear();
             self.clear_selection_and_popup();
             self.chapter_idx = target_ch;
-            self.scroll_handle.set_offset(point(px(0.), px(0.)));
+            self.current_page = 0;
+            self.needs_page_recompute = true;
             self.last_reported_scroll_pct = frac;
             self.emit_progress(false, cx);
         }
         self.pending_scroll_block = None;
         self.pending_scroll_fraction = Some(frac);
-        if self.prefs.pagination == ReaderPaginationPref::Scroll
-            && (switched || !self.apply_pending_scroll())
-        {
-            self.schedule_pending_scroll(cx);
-        } else if self.prefs.pagination == ReaderPaginationPref::Scroll {
-            self.emit_progress(false, cx);
-        }
+        self.needs_page_recompute = true;
         cx.notify();
     }
 
@@ -1475,115 +1443,6 @@ impl EpubView {
         }
     }
 
-    pub(crate) fn compute_block_scroll_target_y(
-        block_win_y: f32,
-        viewport_top_y: f32,
-        current_offset_y: f32,
-        max_scroll_y: f32,
-        top_margin_px: f32,
-    ) -> f32 {
-        if max_scroll_y <= 0.0 {
-            return 0.0;
-        }
-        let content_y = (block_win_y - viewport_top_y) - current_offset_y;
-        (content_y - top_margin_px.max(0.0)).clamp(0.0, max_scroll_y)
-    }
-
-    fn apply_pending_scroll(&mut self) -> bool {
-        if self.prefs.pagination == ReaderPaginationPref::Page {
-            return true;
-        }
-        if self.pending_scroll_block.is_none() && self.pending_scroll_fraction.is_none() {
-            return true;
-        }
-        let scroll_bounds = self.scroll_handle.bounds();
-        let vp_h = f32::from(scroll_bounds.size.height);
-        let ch_has_text = self
-            .book
-            .chapters
-            .get(self.chapter_idx)
-            .is_some_and(|c| c.blocks.iter().any(|b| block_plain_text(b).is_some()));
-        if vp_h <= 0.0 || (ch_has_text && self.rendered_layouts.borrow().is_empty()) {
-            return false;
-        }
-
-        let max_y = f32::from(self.scroll_handle.max_offset().y);
-        if let Some((target_blk, target_byte)) = self.pending_scroll_block {
-            let layouts = self.rendered_layouts.borrow();
-            if let Some((_, base, len, layout)) = layouts.iter().find(|(b, _, _, _)| *b == target_blk) {
-                let win_y = if target_byte > *base {
-                    layout
-                        .position_for_index(target_byte.saturating_sub(*base).min(*len))
-                        .map(|p| f32::from(p.y))
-                        .unwrap_or_else(|| f32::from(layout.bounds().origin.y))
-                } else {
-                    f32::from(layout.bounds().origin.y)
-                };
-                let cur_off_y = f32::from(self.scroll_handle.offset().y);
-                let vp_top_y = f32::from(scroll_bounds.top());
-                let top_margin = (vp_h * 0.12).clamp(28.0, 64.0);
-                let target_y = Self::compute_block_scroll_target_y(
-                    win_y,
-                    vp_top_y,
-                    cur_off_y,
-                    max_y,
-                    top_margin,
-                );
-                drop(layouts);
-                self.pending_scroll_block = None;
-                self.pending_scroll_fraction = None;
-                if max_y > 0.0 {
-                    self.scroll_handle.set_offset(point(px(0.), px(-target_y)));
-                }
-                return true;
-            }
-            drop(layouts);
-            self.pending_scroll_block = None;
-        }
-
-        if let Some(frac) = self.pending_scroll_fraction.take() {
-            let target_y = if max_y > 0.0 {
-                (frac.clamp(0.0, 1.0) * max_y).clamp(0.0, max_y)
-            } else {
-                0.0
-            };
-            if max_y > 0.0 {
-                self.scroll_handle.set_offset(point(px(0.), px(-target_y)));
-            }
-        }
-        true
-    }
-
-    fn schedule_pending_scroll(&mut self, cx: &mut Context<Self>) {
-        self.scroll_jump_gen = self.scroll_jump_gen.wrapping_add(1);
-        let jump_gen = self.scroll_jump_gen;
-        cx.spawn(async move |this, cx| {
-            for delay_ms in [16u64, 32, 64, 128, 250] {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(delay_ms))
-                    .await;
-                let mut stop = false;
-                let updated = this.update(cx, |v, cx| {
-                    if v.scroll_jump_gen != jump_gen {
-                        stop = true;
-                        return;
-                    }
-                    if v.apply_pending_scroll() {
-                        v.emit_progress(false, cx);
-                        cx.notify();
-                        stop = true;
-                    } else {
-                        cx.notify();
-                    }
-                });
-                if updated.is_err() || stop {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
     fn jump_to_active_match(&mut self, cx: &mut Context<Self>) {
         let Some((ch_ix, blk_ix, range)) = self.find_matches.get(self.find_active) else {
             return;
@@ -1594,7 +1453,8 @@ impl EpubView {
             self.rendered_layouts.borrow_mut().clear();
             self.clear_selection_and_popup();
             self.chapter_idx = ch_ix;
-            self.scroll_handle.set_offset(point(px(0.), px(0.)));
+            self.current_page = 0;
+            self.needs_page_recompute = true;
             self.emit_progress(false, cx);
         }
         let total_blocks = self
@@ -1607,13 +1467,7 @@ impl EpubView {
         self.scroll_jump_gen = self.scroll_jump_gen.wrapping_add(1);
         self.pending_scroll_block = Some((blk_ix, byte_start));
         self.pending_scroll_fraction = Some(frac);
-        if self.prefs.pagination == ReaderPaginationPref::Scroll
-            && (switched_chapter || !self.apply_pending_scroll())
-        {
-            self.schedule_pending_scroll(cx);
-        } else if self.prefs.pagination == ReaderPaginationPref::Scroll {
-            self.emit_progress(false, cx);
-        }
+        self.needs_page_recompute = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2788,7 +2642,6 @@ impl EpubView {
         self.pending_scroll_block = None;
         self.pending_scroll_fraction = None;
         self.scroll_jump_gen = self.scroll_jump_gen.wrapping_add(1);
-        self.scroll_handle.set_offset(point(px(0.), px(0.)));
         self.last_reported_scroll_pct = 0.0;
         self.emit_progress(false, cx);
         cx.notify();
@@ -3023,18 +2876,16 @@ impl Render for EpubView {
             ReaderFontPref::Serif => "serif".into(),
             ReaderFontPref::Sans => cx.theme().font_family.clone(),
         };
-        if self.prefs.pagination == ReaderPaginationPref::Page {
-            let vp_b = self.viewport_bounds.get();
-            let vp_w = f32::from(vp_b.size.width);
-            let vp_h = f32::from(vp_b.size.height);
-            if vp_w > 160.0 && vp_h > 220.0 {
-                self.sync_page_layout_with_window(vp_w, vp_h, reader_font_early, window);
-            } else {
-                let entity = cx.entity().clone();
-                window.on_next_frame(move |_, cx| {
-                    let _ = entity.update(cx, |_, cx| cx.notify());
-                });
-            }
+        let vp_b = self.viewport_bounds.get();
+        let vp_w_box = f32::from(vp_b.size.width);
+        let vp_h_box = f32::from(vp_b.size.height);
+        if vp_w_box > 160.0 && vp_h_box > 220.0 {
+            self.sync_page_layout_with_window(vp_w_box, vp_h_box, reader_font_early, window);
+        } else {
+            let entity = cx.entity().clone();
+            window.on_next_frame(move |_, cx| {
+                let _ = entity.update(cx, |_, cx| cx.notify());
+            });
         }
         let cur_scroll = self.current_scroll_pct();
         if !self.scroll_save_scheduled
@@ -3126,119 +2977,69 @@ impl Render for EpubView {
             ReaderFontPref::Sans => cx.theme().font_family.clone(),
         };
 
-        let is_page_mode = self.prefs.pagination == ReaderPaginationPref::Page;
         let two_col = self.prefs.width == ReaderWidthPref::TwoColumn;
-        let vp_h_now = f32::from(self.viewport_bounds.get().size.height);
-        let page_body_h = (vp_h_now - 48.0 - 64.0 - 150.0).max(160.0);
-        let max_img_h = if is_page_mode {
-            460.0_f32.min((page_body_h * 0.72).max(140.0))
+        let vp_w_eff = if vp_w_box > 160.0 {
+            vp_w_box
         } else {
-            460.0
+            f32::from(window.viewport_size().width)
         };
+        let show_side_arrows = vp_w_eff >= 720.0;
+        let side_col_w = if vp_w_eff >= 1120.0 { 96.0 } else { 64.0 };
+        let vp_h_now = vp_h_box;
+        let page_body_h = (vp_h_now - 48.0 - 64.0 - 96.0).max(160.0);
+        let max_img_h = 460.0_f32.min((page_body_h * 0.72).max(140.0));
 
-        let (page_idx, total_pages) = if is_page_mode {
-            let total_p = self.chapter_pages.len().max(1);
-            let cur_p = self.current_page.min(total_p - 1);
-            (cur_p, total_p)
-        } else {
-            (0, 1)
-        };
+        let total_pages = self.chapter_pages.len().max(1);
+        let page_idx = self.current_page.min(total_pages - 1);
 
         self.rendered_layouts.borrow_mut().clear();
 
         let body_element: AnyElement = if let Some(ch) = self.book.chapters.get(cur_ix) {
-            if is_page_mode {
-                let build_page_col = |pg: Option<&ChapterPage>| {
-                    let mut els = Vec::new();
-                    if let Some(p) = pg {
-                        for sl in &p.slices {
-                            if let Some(blk) = ch.blocks.get(sl.block_idx) {
-                                els.push(self.render_epub_block(
-                                    sl.block_idx,
-                                    blk,
-                                    Some(sl),
-                                    cur_ix,
-                                    fs,
-                                    line_mult,
-                                    max_img_h,
-                                    heading_fg,
-                                    text_fg,
-                                    muted_fg,
-                                    code_bg,
-                                    code_fg,
-                                    sel_bg,
-                                    border_c,
-                                    light_paper,
-                                ));
-                            }
+            let build_page_col = |pg: Option<&ChapterPage>| {
+                let mut els = Vec::new();
+                if let Some(p) = pg {
+                    for sl in &p.slices {
+                        if let Some(blk) = ch.blocks.get(sl.block_idx) {
+                            els.push(self.render_epub_block(
+                                sl.block_idx,
+                                blk,
+                                Some(sl),
+                                cur_ix,
+                                fs,
+                                line_mult,
+                                max_img_h,
+                                heading_fg,
+                                text_fg,
+                                muted_fg,
+                                code_bg,
+                                code_fg,
+                                sel_bg,
+                                border_c,
+                                light_paper,
+                            ));
                         }
                     }
-                    v_flex().w_full().gap_3p5().children(els)
-                };
-                if two_col {
-                    h_flex()
-                        .w_full()
-                        .flex_1()
-                        .gap_8()
-                        .items_start()
-                        .child(div().flex_1().min_w_0().child(build_page_col(
-                            self.chapter_pages.get(page_idx),
-                        )))
-                        .child(div().w(px(1.)).self_stretch().bg(border_c))
-                        .child(div().flex_1().min_w_0().child(build_page_col(
-                            self.chapter_pages.get(page_idx + 1),
-                        )))
-                        .into_any_element()
-                } else {
-                    build_page_col(self.chapter_pages.get(page_idx))
-                        .flex_1()
-                        .into_any_element()
                 }
+                v_flex().w_full().gap_3p5().children(els)
+            };
+            if two_col {
+                h_flex()
+                    .w_full()
+                    .flex_1()
+                    .gap_8()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(build_page_col(
+                        self.chapter_pages.get(page_idx),
+                    )))
+                    .child(div().w(px(1.)).self_stretch().bg(border_c))
+                    .child(div().flex_1().min_w_0().child(build_page_col(
+                        self.chapter_pages.get(page_idx + 1),
+                    )))
+                    .into_any_element()
             } else {
-                let mut chapter_blocks: Vec<AnyElement> = ch
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(blk_ix, blk)| {
-                        self.render_epub_block(
-                            blk_ix,
-                            blk,
-                            None,
-                            cur_ix,
-                            fs,
-                            line_mult,
-                            max_img_h,
-                            heading_fg,
-                            text_fg,
-                            muted_fg,
-                            code_bg,
-                            code_fg,
-                            sel_bg,
-                            border_c,
-                            light_paper,
-                        )
-                    })
-                    .collect();
-
-                if two_col && chapter_blocks.len() >= 4 {
-                    let mid = chapter_blocks.len().div_ceil(2);
-                    let right_col = chapter_blocks.split_off(mid);
-                    let left_col = chapter_blocks;
-                    h_flex()
-                        .w_full()
-                        .gap_8()
-                        .items_start()
-                        .child(v_flex().flex_1().min_w_0().gap_3p5().children(left_col))
-                        .child(div().w(px(1.)).self_stretch().bg(border_c))
-                        .child(v_flex().flex_1().min_w_0().gap_3p5().children(right_col))
-                        .into_any_element()
-                } else {
-                    v_flex()
-                        .w_full()
-                        .gap_3p5()
-                        .children(chapter_blocks)
-                        .into_any_element()
-                }
+                build_page_col(self.chapter_pages.get(page_idx))
+                    .flex_1()
+                    .into_any_element()
             }
         } else {
             div()
@@ -3285,47 +3086,8 @@ impl Render for EpubView {
 
         let is_last_chapter = cur_ix + 1 >= ch_count;
         let step = if two_col { 2 } else { 1 };
-        let at_book_end = is_last_chapter && (!is_page_mode || page_idx + step >= total_pages);
-        let at_book_start = cur_ix == 0 && (!is_page_mode || page_idx == 0);
-        let prev_label = if is_page_mode {
-            "Previous Page"
-        } else {
-            "Previous Chapter"
-        };
-        let next_label = if is_page_mode && page_idx + 1 < total_pages {
-            "Next Page"
-        } else {
-            "Next Chapter"
-        };
-        let footer_right = if at_book_end {
-            Button::new("epub-foot-finish")
-                .with_variant(if self.is_finished {
-                    ButtonVariant::Secondary
-                } else {
-                    ButtonVariant::Primary
-                })
-                .small()
-                .icon(IconName::BookCheck)
-                .label(if self.is_finished {
-                    "Finished"
-                } else {
-                    "Mark Finished"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.mark_finished(cx);
-                }))
-                .into_any_element()
-        } else {
-            Button::new("epub-foot-next")
-                .ghost()
-                .small()
-                .icon(IconName::ChevronRight)
-                .label(next_label)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.next_page_or_chapter(cx);
-                }))
-                .into_any_element()
-        };
+        let at_book_end = is_last_chapter && page_idx + step >= total_pages;
+        let at_book_start = cur_ix == 0 && page_idx == 0;
 
         let loc = self.global_location();
         let overall_pct = if self.is_finished {
@@ -3390,8 +3152,7 @@ impl Render for EpubView {
                         this.next_page_or_chapter(cx);
                     }
                     "space"
-                        if is_page_mode
-                            && this.popup.is_none()
+                        if this.popup.is_none()
                             && !this.find_open
                             && !this.bookmarks_open =>
                     {
@@ -3425,41 +3186,183 @@ impl Render for EpubView {
                             .size_full()
                             .overflow_hidden()
                             .child({
-                                let reader_shell = div()
+                                let page_card = v_flex()
+                                    .w_full()
+                                    .h_full()
+                                    .when_some(self.prefs.width.max_width_px_opt(), |d, w| {
+                                        d.max_w(px(w))
+                                    })
+                                    .font_family(reader_font)
+                                    .p(px(if self.zen_mode { 28. } else { 28. }))
+                                    .gap_4()
+                                    .rounded(px(if self.zen_mode { 12. } else { 10. }))
+                                    .bg(page_bg)
+                                    .border_1()
+                                    .border_color(if self.zen_mode {
+                                        gpui_kit::transparent_black()
+                                    } else {
+                                        border_c
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .pb_3()
+                                            .border_b_1()
+                                            .border_color(border_c)
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted_fg)
+                                                    .truncate()
+                                                    .child(author_line),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .italic()
+                                                    .text_color(muted_fg)
+                                                    .child(ch_title),
+                                            ),
+                                    )
+                                    .child(body_element);
+
+                                let center_col = div()
+                                    .h_full()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .py(px(if self.zen_mode { 22. } else { 18. }))
+                                    .px(px(if show_side_arrows { 8. } else { 20. }))
+                                    .flex()
+                                    .justify_center()
+                                    .child(page_card);
+
+                                let main_stage: AnyElement = if show_side_arrows {
+                                    let base_alpha = if self.zen_mode { 0.14 } else { 0.38 };
+                                    let left_arrow = div()
+                                        .id("epub-side-prev")
+                                        .w(px(side_col_w))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .when(!at_book_start, |d| {
+                                            d.cursor_pointer()
+                                                .opacity(base_alpha)
+                                                .hover(|s| {
+                                                    s.opacity(1.0)
+                                                        .bg(crate::theme::accent_alpha(0x14))
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.prev_page_or_chapter(cx);
+                                                }))
+                                        })
+                                        .when(at_book_start, |d| d.opacity(0.08))
+                                        .child(
+                                            Icon::new(IconName::ChevronLeft)
+                                                .size(px(40.))
+                                                .text_color(text_fg),
+                                        );
+
+                                    let right_arrow = if at_book_end {
+                                        div()
+                                            .id("epub-side-finish")
+                                            .w(px(side_col_w))
+                                            .h_full()
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .opacity(if self.is_finished { 0.35 } else { 0.65 })
+                                            .hover(|s| {
+                                                s.opacity(1.0)
+                                                    .bg(crate::theme::accent_alpha(0x14))
+                                            })
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.mark_finished(cx);
+                                            }))
+                                            .child(
+                                                Icon::new(IconName::BookCheck)
+                                                    .size(px(34.))
+                                                    .text_color(hex_color(kd::GREEN)),
+                                            )
+                                    } else {
+                                        div()
+                                            .id("epub-side-next")
+                                            .w(px(side_col_w))
+                                            .h_full()
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .opacity(base_alpha)
+                                            .hover(|s| {
+                                                s.opacity(1.0)
+                                                    .bg(crate::theme::accent_alpha(0x14))
+                                            })
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.next_page_or_chapter(cx);
+                                            }))
+                                            .child(
+                                                Icon::new(IconName::ChevronRight)
+                                                    .size(px(40.))
+                                                    .text_color(text_fg),
+                                            )
+                                    };
+
+                                    h_flex()
+                                        .size_full()
+                                        .items_stretch()
+                                        .child(left_arrow)
+                                        .child(center_col)
+                                        .child(right_arrow)
+                                        .into_any_element()
+                                } else {
+                                    center_col.into_any_element()
+                                };
+
+                                div()
                                     .id(SharedString::from(format!(
                                         "epub-ch-scroll-{:?}",
                                         cx.entity_id()
                                     )))
                                     .size_full()
+                                    .overflow_hidden()
                                     .flex()
-                                    .flex_col();
-                                let reader_shell = if is_page_mode {
-                                    reader_shell
-                                        .overflow_hidden()
-                                        .on_scroll(cx.listener(|this, ev: &gpui_kit::ScrollEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            let dy = f32::from(ev.delta.pixel_delta(px(24.)).y);
-                                            if dy.abs() < 6.0 {
-                                                return;
+                                    .flex_col()
+                                    .on_scroll(cx.listener(|this, ev: &gpui_kit::ScrollEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        let dy = f32::from(ev.delta.pixel_delta(px(24.)).y);
+                                        if dy.abs() < 6.0 {
+                                            return;
+                                        }
+                                        let ready = this.last_wheel_page_at.is_none_or(|t| {
+                                            t.elapsed() >= Duration::from_millis(240)
+                                        });
+                                        if ready {
+                                            this.last_wheel_page_at = Some(Instant::now());
+                                            if dy < 0.0 {
+                                                this.next_page_or_chapter(cx);
+                                            } else {
+                                                this.prev_page_or_chapter(cx);
                                             }
-                                            let ready = this.last_wheel_page_at.is_none_or(|t| {
-                                                t.elapsed() >= std::time::Duration::from_millis(240)
-                                            });
-                                            if ready {
-                                                this.last_wheel_page_at = Some(std::time::Instant::now());
-                                                if dy < 0.0 {
-                                                    this.next_page_or_chapter(cx);
-                                                } else {
-                                                    this.prev_page_or_chapter(cx);
-                                                }
-                                            }
-                                        }))
-                                } else {
-                                    reader_shell
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.scroll_handle)
-                                };
-                                reader_shell
+                                        }
+                                    }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -3619,117 +3522,89 @@ impl Render for EpubView {
                                     cx.notify();
                                 }),
                             )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w_full()
-                                    .when(is_page_mode, |d| d.h_full())
-                                    .when(!is_page_mode, |d| d.min_h_full())
-                                    .py_6()
-                                    .px_6()
-                                    .flex()
-                                    .justify_center()
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .when(is_page_mode, |d| d.h_full())
-                                            .when_some(self.prefs.width.max_width_px_opt(), |d, w| {
-                                                d.max_w(px(w))
-                                            })
-                                    .font_family(reader_font)
-                                    .p_8()
-                                    .gap_4()
-                                    .rounded(px(10.))
-                                    .bg(page_bg)
-                                    .border_1()
-                                    .border_color(border_c)
-                                    .child(
-                                        h_flex()
-                                            .pb_3()
-                                            .border_b_1()
-                                            .border_color(border_c)
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted_fg)
-                                                    .truncate()
-                                                    .child(author_line),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .italic()
-                                                    .text_color(muted_fg)
-                                                    .child(ch_title),
-                                            ),
-                                    )
-                                    .child(body_element)
-                                    .child(
-                                        h_flex()
-                                            .pt_5()
-                                            .mt_4()
-                                            .border_t_1()
-                                            .border_color(border_c)
-                                            .justify_between()
-                                            .child(
-                                                Button::new("epub-foot-prev")
-                                                    .ghost()
-                                                    .small()
-                                                    .icon(IconName::ChevronLeft)
-                                                    .label(prev_label)
-                                                    .disabled(at_book_start)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.prev_page_or_chapter(cx);
-                                                    })),
-                                            )
-                                            .child(footer_right),
-                                    ),
-                            ),
-                                    )
+                            .child(main_stage)
                             })
-                            .when(!is_page_mode, |el| el.vertical_scrollbar(&self.scroll_handle))
                     )
                     .when_some(find_bar, |root, bar| root.child(bar))
                     .when_some(annotations_popover, |root, pop| root.child(pop))
                     .when_some(hl_popup, |root, pop| root.child(pop)),
             )
-            .child(
-                h_flex()
-                    .h(px(26.))
-                    .w_full()
-                    .px_4()
-                    .gap_3()
-                    .items_center()
-                    .bg(outer_bg)
-                    .border_t_1()
-                    .border_color(border_c)
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(px(3.))
-                            .rounded_full()
-                            .bg(border_c)
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(overall_pct.clamp(0.0, 1.0)))
-                                    .bg(if self.is_finished {
-                                        hex_color(kd::GREEN)
-                                    } else {
-                                        hex_color(kd::VIOLET)
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(footer_meta),
-                    ),
-            )
+            .when(!self.zen_mode, |root| {
+                root.child(
+                    h_flex()
+                        .h(px(26.))
+                        .w_full()
+                        .px_4()
+                        .gap_3()
+                        .items_center()
+                        .bg(outer_bg)
+                        .border_t_1()
+                        .border_color(border_c)
+                        .when(!show_side_arrows, |bar| {
+                            bar.child(
+                                Button::new("epub-foot-prev")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ChevronLeft)
+                                    .disabled(at_book_start)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prev_page_or_chapter(cx);
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(3.))
+                                .rounded_full()
+                                .bg(border_c)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(overall_pct.clamp(0.0, 1.0)))
+                                        .bg(if self.is_finished {
+                                            hex_color(kd::GREEN)
+                                        } else {
+                                            hex_color(kd::VIOLET)
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(footer_meta),
+                        )
+                        .when(!show_side_arrows, |bar| {
+                            if at_book_end {
+                                bar.child(
+                                    Button::new("epub-foot-finish")
+                                        .with_variant(if self.is_finished {
+                                            ButtonVariant::Secondary
+                                        } else {
+                                            ButtonVariant::Primary
+                                        })
+                                        .xsmall()
+                                        .icon(IconName::BookCheck)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mark_finished(cx);
+                                        })),
+                                )
+                            } else {
+                                bar.child(
+                                    Button::new("epub-foot-next")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::ChevronRight)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.next_page_or_chapter(cx);
+                                        })),
+                                )
+                            }
+                        }),
+                )
+            })
             .into_any_element()
     }
 }
@@ -3753,14 +3628,13 @@ pub fn render_epub_tab(
     let theme_label = ev.prefs.theme.label();
     let font_label = ev.prefs.font.label();
     let width_label = ev.prefs.width.label();
-    let page_mode = ev.prefs.pagination == ReaderPaginationPref::Page;
-    let page_mode_label = ev.prefs.pagination.label();
     let spacing_label = ev.prefs.spacing.label();
     let ann_count = ev.highlights.len() + ev.bookmarks.len();
     let bm_open = ev.bookmarks_open;
     let cur_ch = ev.chapter_idx;
     let total_ch = ev.book.chapters.len();
     let find_open = ev.find_open;
+    let zen_mode = ev.zen_mode;
 
     let v_find = view.clone();
     let v_prev = view.clone();
@@ -3769,7 +3643,6 @@ pub fn render_epub_tab(
     let v_lg = view.clone();
     let v_font = view.clone();
     let v_width = view.clone();
-    let v_page = view.clone();
     let v_spacing = view.clone();
     let v_thm = view.clone();
     let v_bm = view.clone();
@@ -3891,21 +3764,6 @@ pub fn render_epub_tab(
                         })),
                 )
                 .child(
-                    Button::new(SharedString::from(format!("epub-page-mode-{tab_id}")))
-                        .with_variant(if page_mode {
-                            ButtonVariant::Primary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .xsmall()
-                        .icon(IconName::FileText)
-                        .label(page_mode_label)
-                        .tooltip("Toggle Paginated Page View vs Continuous Scroll")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            v_page.update(cx, |v, cx| v.toggle_pagination(cx));
-                        })),
-                )
-                .child(
                     Button::new(SharedString::from(format!("epub-space-{tab_id}")))
                         .ghost()
                         .xsmall()
@@ -3960,6 +3818,25 @@ pub fn render_epub_tab(
                                 });
                             })
                         }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("epub-zen-{tab_id}")))
+                        .with_variant(if zen_mode {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(if zen_mode {
+                            IconName::Minimize2
+                        } else {
+                            IconName::Maximize2
+                        })
+                        .label("Zen")
+                        .tooltip("Zen Reading Mode (F11 / Ctrl+Alt+Z)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_zen_mode(window, cx);
+                        })),
                 ),
         );
 
@@ -3969,40 +3846,4 @@ pub fn render_epub_tab(
         .child(header)
         .child(div().flex_1().min_h_0().w_full().child(view.clone()))
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::EpubView;
-
-    #[test]
-    fn compute_block_scroll_target_y_handles_scrolled_and_unscrolled_coords() {
-        // Viewport top at y=100, currently unscrolled (offset.y=0), block at win_y=900, margin=50 -> 750.
-        let target = EpubView::compute_block_scroll_target_y(900.0, 100.0, 0.0, 2000.0, 50.0);
-        assert!((target - 750.0).abs() < 1e-4);
-
-        // Same block when already scrolled down 300px (offset.y=-300 => painted win_y=600) must yield identical 750.
-        let target_scrolled =
-            EpubView::compute_block_scroll_target_y(600.0, 100.0, -300.0, 2000.0, 50.0);
-        assert!((target_scrolled - 750.0).abs() < 1e-4);
-
-        // Jumping UP to an earlier block scrolled offscreen above viewport (offset.y=-1200, win_y=-800 -> content_y=300 -> 250).
-        let target_up =
-            EpubView::compute_block_scroll_target_y(-800.0, 100.0, -1200.0, 2000.0, 50.0);
-        assert!((target_up - 250.0).abs() < 1e-4);
-
-        // Clamps to [0, max_scroll_y] and returns 0 when non-scrollable.
-        assert_eq!(
-            EpubView::compute_block_scroll_target_y(120.0, 100.0, 0.0, 2000.0, 50.0),
-            0.0
-        );
-        assert_eq!(
-            EpubView::compute_block_scroll_target_y(3500.0, 100.0, 0.0, 2000.0, 50.0),
-            2000.0
-        );
-        assert_eq!(
-            EpubView::compute_block_scroll_target_y(500.0, 100.0, 0.0, 0.0, 50.0),
-            0.0
-        );
-    }
 }
