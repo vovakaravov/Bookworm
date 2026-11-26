@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -348,6 +349,194 @@ impl ReaderPaginationPref {
             Self::Page => Self::Scroll,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageSlice {
+    pub block_idx: usize,
+    pub byte_range: Range<usize>,
+    pub is_continuation: bool,
+    pub continues_next: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterPage {
+    pub slices: Vec<PageSlice>,
+    pub show_chapter_header: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum MeasuredBlock {
+    Text {
+        block_idx: usize,
+        line_ranges: Vec<Range<usize>>,
+        line_height: f32,
+        pad_top: f32,
+        pad_bottom: f32,
+        is_heading: bool,
+    },
+    Fixed {
+        block_idx: usize,
+        height: f32,
+    },
+}
+
+/// Packs shaped visual lines and fixed blocks (images/rules) into exact-height pages
+/// without vertical scroll fighting or half-clipped lines.
+pub fn paginate_measured_blocks(
+    blocks: &[MeasuredBlock],
+    page_height: f32,
+    chapter_header_height: f32,
+    block_gap: f32,
+) -> Vec<ChapterPage> {
+    let eff_page_h = page_height.max(80.0);
+    let hdr_h = chapter_header_height.max(0.0).min(eff_page_h * 0.55);
+    let gap = block_gap.max(0.0);
+
+    let mut pages: Vec<ChapterPage> = Vec::new();
+    let mut cur = ChapterPage {
+        slices: Vec::new(),
+        show_chapter_header: hdr_h > 0.5,
+    };
+    let mut used_h = hdr_h;
+
+    let flush_page = |pages: &mut Vec<ChapterPage>,
+                      cur: &mut ChapterPage,
+                      used_h: &mut f32| {
+        pages.push(std::mem::replace(
+            cur,
+            ChapterPage {
+                slices: Vec::new(),
+                show_chapter_header: false,
+            },
+        ));
+        *used_h = 0.0;
+    };
+
+    for blk in blocks {
+        match blk {
+            MeasuredBlock::Fixed { block_idx, height } => {
+                let h = height.max(4.0);
+                let needed = if cur.slices.is_empty() { h } else { gap + h };
+                if !cur.slices.is_empty() && used_h + needed > eff_page_h + 0.5 {
+                    flush_page(&mut pages, &mut cur, &mut used_h);
+                }
+                let add_gap = if cur.slices.is_empty() { 0.0 } else { gap };
+                cur.slices.push(PageSlice {
+                    block_idx: *block_idx,
+                    byte_range: 0..0,
+                    is_continuation: false,
+                    continues_next: false,
+                });
+                used_h += add_gap + h;
+            }
+            MeasuredBlock::Text {
+                block_idx,
+                line_ranges,
+                line_height,
+                pad_top,
+                pad_bottom,
+                is_heading,
+            } => {
+                let lh = line_height.max(10.0);
+                let top_p = pad_top.max(0.0);
+                let bot_p = pad_bottom.max(0.0);
+                if line_ranges.is_empty() {
+                    continue;
+                }
+
+                let total_block_h = top_p + bot_p + lh * (line_ranges.len() as f32);
+                let lead_gap = if cur.slices.is_empty() { 0.0 } else { gap };
+
+                // Heading orphan guard: move heading + at least ~2 body lines together onto next page.
+                if *is_heading
+                    && !cur.slices.is_empty()
+                    && used_h + lead_gap + total_block_h + gap + 48.0 > eff_page_h + 0.5
+                {
+                    flush_page(&mut pages, &mut cur, &mut used_h);
+                }
+
+                let mut start_line = 0usize;
+                let mut is_cont = false;
+                while start_line < line_ranges.len() {
+                    let add_gap = if cur.slices.is_empty() { 0.0 } else { gap };
+                    let cur_top_p = if is_cont { 0.0 } else { top_p };
+                    let avail = eff_page_h - used_h - add_gap - cur_top_p;
+
+                    // If not even 1 line fits on a non-empty page, start a fresh page cleanly.
+                    if !cur.slices.is_empty() && avail + 0.5 < lh {
+                        flush_page(&mut pages, &mut cur, &mut used_h);
+                        continue;
+                    }
+
+                    let eff_avail = avail.max(lh);
+                    let remaining_lines = line_ranges.len() - start_line;
+                    let max_lines_without_bottom = ((eff_avail + 0.5) / lh).floor().max(1.0) as usize;
+
+                    let (take_lines, add_bot_p, continues_next) =
+                        if remaining_lines <= max_lines_without_bottom {
+                            let with_bot = cur_top_p + (remaining_lines as f32) * lh + bot_p;
+                            if !cur.slices.is_empty() && used_h + add_gap + with_bot > eff_page_h + 0.5
+                                && remaining_lines > 1
+                            {
+                                (remaining_lines - 1, 0.0, true)
+                            } else {
+                                (remaining_lines, bot_p, false)
+                            }
+                        } else {
+                            (max_lines_without_bottom.min(remaining_lines), 0.0, true)
+                        };
+
+                    let end_line = start_line + take_lines;
+                    let byte_start = line_ranges[start_line].start;
+                    let byte_end = line_ranges[end_line - 1].end;
+                    cur.slices.push(PageSlice {
+                        block_idx: *block_idx,
+                        byte_range: byte_start..byte_end,
+                        is_continuation: is_cont,
+                        continues_next,
+                    });
+                    used_h += add_gap + cur_top_p + (take_lines as f32) * lh + add_bot_p;
+
+                    start_line = end_line;
+                    is_cont = true;
+                    if continues_next {
+                        flush_page(&mut pages, &mut cur, &mut used_h);
+                    }
+                }
+            }
+        }
+    }
+
+    if !cur.slices.is_empty() || pages.is_empty() {
+        pages.push(cur);
+    }
+    pages
+}
+
+pub fn page_index_for_block(
+    pages: &[ChapterPage],
+    block_idx: usize,
+    byte_offset: usize,
+) -> usize {
+    for (p_ix, page) in pages.iter().enumerate() {
+        for slice in &page.slices {
+            if slice.block_idx == block_idx {
+                if slice.byte_range.is_empty()
+                    || (byte_offset >= slice.byte_range.start && byte_offset <= slice.byte_range.end)
+                {
+                    return p_ix;
+                }
+            }
+        }
+    }
+    // Fallback to first page containing `block_idx`, or nearest earlier page.
+    for (p_ix, page) in pages.iter().enumerate() {
+        if page.slices.iter().any(|s| s.block_idx >= block_idx) {
+            return p_ix;
+        }
+    }
+    pages.len().saturating_sub(1)
 }
 
 /// Computes discrete `(page_start_y, page_clip_h)` slices for a chapter so page breaks
@@ -1931,5 +2120,68 @@ mod tests {
         assert_eq!(prefs.width, ReaderWidthPref::Standard);
         assert_eq!(prefs.pagination, ReaderPaginationPref::Scroll);
         assert_eq!(ReaderWidthPref::Full.max_width_px_opt(), None);
+    }
+
+    #[test]
+    fn paginate_measured_blocks_splits_paragraphs_and_avoids_heading_orphans() {
+        // 5-line paragraph split across pages after a heading + header
+        let lines: Vec<Range<usize>> = (0..5).map(|i| (i * 20)..((i + 1) * 20)).collect();
+        let blocks = vec![
+            MeasuredBlock::Text {
+                block_idx: 0,
+                line_ranges: vec![0..10],
+                line_height: 24.0,
+                pad_top: 8.0,
+                pad_bottom: 4.0,
+                is_heading: true,
+            },
+            MeasuredBlock::Text {
+                block_idx: 1,
+                line_ranges: lines.clone(),
+                line_height: 24.0,
+                pad_top: 4.0,
+                pad_bottom: 4.0,
+                is_heading: false,
+            },
+            // Near end of page 1: a heading that shouldn't be orphaned at bottom
+            MeasuredBlock::Text {
+                block_idx: 2,
+                line_ranges: vec![0..12],
+                line_height: 28.0,
+                pad_top: 8.0,
+                pad_bottom: 4.0,
+                is_heading: true,
+            },
+            MeasuredBlock::Fixed {
+                block_idx: 3,
+                height: 60.0,
+            },
+        ];
+
+        // Page height 170, header 50, block gap 12:
+        // Page 0: header (50) + blk0 (36) + gap (12) -> 72 left -> 2 lines of blk1 fit (4+48 = 52).
+        let pages = paginate_measured_blocks(&blocks, 170.0, 50.0, 12.0);
+        assert!(pages.len() >= 2);
+        assert!(pages[0].show_chapter_header);
+        assert!(!pages[1].show_chapter_header);
+        // blk1 splits with continues_next -> is_continuation
+        let first_blk1 = pages[0].slices.iter().find(|s| s.block_idx == 1).unwrap();
+        assert!(!first_blk1.is_continuation);
+        assert!(first_blk1.continues_next);
+        assert_eq!(first_blk1.byte_range, 0..40);
+
+        let cont_blk1 = pages[1].slices.iter().find(|s| s.block_idx == 1).unwrap();
+        assert!(cont_blk1.is_continuation);
+        assert_eq!(cont_blk1.byte_range.start, 40);
+
+        // Heading 2 stays with blk 3 on the same page
+        let p_h2 = page_index_for_block(&pages, 2, 0);
+        let p_b3 = page_index_for_block(&pages, 3, 0);
+        assert_eq!(p_h2, p_b3);
+        assert_eq!(page_index_for_block(&pages, 1, 55), 1);
+
+        // Empty chapter still produces 1 empty page
+        let empty = paginate_measured_blocks(&[], 400.0, 60.0, 12.0);
+        assert_eq!(empty.len(), 1);
     }
 }
