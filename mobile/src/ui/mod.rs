@@ -2054,9 +2054,16 @@ impl BookwormMobileApp {
             .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
             .unwrap_or(360.0);
         if can_advance {
-            let sx = start_x.unwrap_or(0.0);
-            let dur = if sx.abs() > 1.0 { 175 } else { 210 };
-            self.reader_start_page_flip_anim(sx, -vp_w, 1, step, dur, cx);
+            if let Some(sx) = start_x {
+                self.reader_start_page_flip_anim(sx, -vp_w, 1, step, 175, cx);
+            } else {
+                if let Some(r) = &mut self.reader {
+                    r.swipe_offset_x = 0.0;
+                    r.swipe_active = false;
+                }
+                self.apply_page_step(step, window, cx);
+                cx.notify();
+            }
         } else if let Some(sx) = start_x
             && sx.abs() > 1.0
         {
@@ -2083,9 +2090,16 @@ impl BookwormMobileApp {
             .map(|r| f32::from(r.viewport_bounds.get().size.width).max(320.0))
             .unwrap_or(360.0);
         if can_retreat {
-            let sx = start_x.unwrap_or(0.0);
-            let dur = if sx.abs() > 1.0 { 175 } else { 210 };
-            self.reader_start_page_flip_anim(sx, vp_w, -1, -step, dur, cx);
+            if let Some(sx) = start_x {
+                self.reader_start_page_flip_anim(sx, vp_w, -1, -step, 175, cx);
+            } else {
+                if let Some(r) = &mut self.reader {
+                    r.swipe_offset_x = 0.0;
+                    r.swipe_active = false;
+                }
+                self.apply_page_step(-step, window, cx);
+                cx.notify();
+            }
         } else if let Some(sx) = start_x
             && sx.abs() > 1.0
         {
