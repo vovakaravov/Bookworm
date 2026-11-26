@@ -566,6 +566,22 @@ pub fn render_reader_view(
     let Some(r) = &app.reader else {
         return div().size_full().into_any_element();
     };
+    if let Some(anim) = &r.flip_anim {
+        let anim_gen = r.flip_anim_gen;
+        let done = anim.started_at.elapsed().as_millis() as u64 >= anim.duration_ms;
+        let entity = cx.entity().clone();
+        if done {
+            window.on_next_frame(move |window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.finish_page_flip_anim(anim_gen, window, cx);
+                });
+            });
+        } else {
+            window.on_next_frame(move |_, cx| {
+                let _ = entity.update(cx, |_, cx| cx.notify());
+            });
+        }
+    }
     let book_rel = &r.book_rel;
     let book_title = &r.book_title;
     let book = &r.book;
@@ -886,10 +902,16 @@ pub fn render_reader_view(
                         }))
                         .child(rt.label())
                 })),
+        )
+        .with_animation(
+            "rdr-settings-drop",
+            Animation::new(Duration::from_millis(175)).with_easing(ease_out_quint()),
+            |el, t| el.mt(px(-14.0 * (1.0 - t))).opacity(t),
         );
 
     let main_area = if *show_toc {
         div()
+            .id("rdr-toc-panel")
             .relative()
             .flex_1()
             .min_h_0()
@@ -957,6 +979,11 @@ pub fn render_reader_view(
                     ),
             )
             .child(Scrollbar::vertical(&app.toc_scroll))
+            .with_animation(
+                "rdr-toc-fade",
+                Animation::new(Duration::from_millis(170)).with_easing(ease_out_quint()),
+                |el, t| el.mt(px(-10.0 * (1.0 - t))).opacity(t),
+            )
             .into_any_element()
     } else if *show_notes {
         let active_color_filter = *notes_color_filter;
@@ -1043,6 +1070,7 @@ pub fn render_reader_view(
             );
 
         div()
+            .id("rdr-notes-panel")
             .relative()
             .flex_1()
             .min_h_0()
@@ -1159,9 +1187,7 @@ pub fn render_reader_view(
                                                 cx.stop_propagation();
                                                 this.library_store
                                                     .delete_bookmark(&bm_rel_key, &bm_del_id);
-                                                let _ = this
-                                                    .library_store
-                                                    .sync_save(&this.library_state_root);
+                                                this.schedule_library_sync_save(true, cx);
                                                 cx.notify();
                                             })),
                                     )
@@ -1213,9 +1239,7 @@ pub fn render_reader_view(
                                                     cx.stop_propagation();
                                                     this.library_store
                                                         .delete_highlight(&rel_key, &hl_id);
-                                                    let _ = this
-                                                        .library_store
-                                                        .sync_save(&this.library_state_root);
+                                                    this.schedule_library_sync_save(true, cx);
                                                     cx.notify();
                                                 })),
                                             ),
@@ -1241,6 +1265,11 @@ pub fn render_reader_view(
                     ),
             )
             .child(Scrollbar::vertical(&app.notes_scroll))
+            .with_animation(
+                "rdr-notes-fade",
+                Animation::new(Duration::from_millis(170)).with_easing(ease_out_quint()),
+                |el, t| el.mt(px(-10.0 * (1.0 - t))).opacity(t),
+            )
             .into_any_element()
     } else {
         rendered_layouts.borrow_mut().clear();
@@ -2569,6 +2598,11 @@ pub fn render_reader_view(
                                     ),
                             ),
                     ),
+            )
+            .with_animation(
+                "rdr-draft-rise",
+                Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
+                |el, t| el.mb(px(-28.0 * (1.0 - t))).opacity(t),
             )
     });
 

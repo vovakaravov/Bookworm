@@ -6,6 +6,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
+use std::rc::Rc;
+use std::time::Duration;
 
 fn lib_icon(name: IconName, sz: f32, color: u32) -> impl IntoElement {
     Icon::new(name).size(px(sz)).text_color(hex_color(color))
@@ -216,14 +218,15 @@ fn render_continue_reading_hero(
         )
 }
 
-fn render_book_card(
+fn render_book_card_in_row(
     book: &BookRecord,
     ix: usize,
-    cx: &mut Context<BookwormMobileApp>,
+    app_weak: AnyWeakEntity,
 ) -> impl IntoElement {
     let rel = book.rel_path.clone();
     let rel_lp = book.rel_path.clone();
-    let app_weak_card = cx.entity().downgrade();
+    let weak_click = app_weak.clone();
+    let weak_lp = app_weak;
     let title = book.display_title().to_string();
     let author = book.authors_display();
     let pct = book.progress_pct();
@@ -298,13 +301,23 @@ fn render_book_card(
         .flex()
         .flex_col()
         .gap_2()
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_book(&rel, window, cx);
-        }))
+        .on_click(move |_, window, cx| {
+            if let Some(any_ent) = weak_click.upgrade()
+                && let Ok(ent) = any_ent.downcast::<BookwormMobileApp>()
+            {
+                ent.update(cx, |this, cx| {
+                    this.open_book(&rel, window, cx);
+                });
+            }
+        })
         .child(long_press_overlay(move |_, window, cx| {
-            let _ = app_weak_card.update(cx, |this, cx| {
-                this.open_book_context_menu(rel_lp.clone(), window, cx);
-            });
+            if let Some(any_ent) = weak_lp.upgrade()
+                && let Ok(ent) = any_ent.downcast::<BookwormMobileApp>()
+            {
+                ent.update(cx, |this, cx| {
+                    this.open_book_context_menu(rel_lp.clone(), window, cx);
+                });
+            }
         }))
         .child(cover_el)
         .child(
@@ -597,79 +610,116 @@ pub fn render_library_tab(
         );
 
     let grid = if filtered.is_empty() {
-        v_flex()
-            .w_full()
-            .p_4()
-            .gap_3()
+        div()
+            .id("library-empty-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&app.library_scroll)
             .child(
                 v_flex()
                     .w_full()
                     .p_4()
-                    .gap_2p5()
-                    .rounded(px(12.))
-                    .bg(hex_color(kd::BG_SIDEBAR))
-                    .border_1()
-                    .border_color(hex_color(kd::BORDER_SUBTLE))
+                    .gap_3()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(hex_color(kd::FG))
-                            .child("No EPUB books found here"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(hex_color(kd::FG_SUBTLE))
-                            .child(format!(
-                                "Currently scanning: {books_root_display}. Pick another folder or create a sample book."
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .pt_1()
-                            .gap_2()
-                            .flex_wrap()
+                        v_flex()
+                            .w_full()
+                            .p_4()
+                            .gap_2p5()
+                            .rounded(px(12.))
+                            .bg(hex_color(kd::BG_SIDEBAR))
+                            .border_1()
+                            .border_color(hex_color(kd::BORDER_SUBTLE))
                             .child(
-                                Button::new("lib-empty-pick-root")
-                                    .primary()
-                                    .small()
-                                    .label("Choose Books Folder")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_folder_picker(window, cx);
-                                    })),
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hex_color(kd::FG))
+                                    .child("No EPUB books found here"),
                             )
                             .child(
-                                Button::new("lib-empty-sample")
-                                    .secondary()
-                                    .small()
-                                    .label("Create Sample EPUB")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.create_sample_book(cx);
-                                    })),
+                                div()
+                                    .text_xs()
+                                    .text_color(hex_color(kd::FG_SUBTLE))
+                                    .child(format!(
+                                        "Currently scanning: {books_root_display}. Pick another folder or create a sample book."
+                                    )),
+                            )
+                            .child(
+                                h_flex()
+                                    .pt_1()
+                                    .gap_2()
+                                    .flex_wrap()
+                                    .child(
+                                        Button::new("lib-empty-pick-root")
+                                            .primary()
+                                            .small()
+                                            .label("Choose Books Folder")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_folder_picker(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("lib-empty-sample")
+                                            .secondary()
+                                            .small()
+                                            .label("Create Sample EPUB")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.create_sample_book(cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
             .into_any_element()
     } else {
-        let mut content = v_flex().w_full().gap_2();
-        if let Some(hero) = continue_book {
-            content = content.child(render_continue_reading_hero(&hero, cx));
-        }
-        let mut rows = v_flex().w_full().p_3().gap_3();
-        let chunks = filtered.chunks(cols);
-        for (row_ix, chunk) in chunks.enumerate() {
-            let mut row = h_flex().w_full().gap_2p5().items_stretch();
-            for (c_ix, book) in chunk.iter().enumerate() {
-                let global_ix = row_ix * cols + c_ix;
-                row = row.child(render_book_card(book, global_ix, cx));
-            }
-            for _ in chunk.len()..cols {
-                row = row.child(div().flex_1());
-            }
-            rows = rows.child(row);
-        }
-        content.child(rows).into_any_element()
+        let books_rc: Rc<Vec<BookRecord>> = Rc::new(filtered.into_iter().cloned().collect());
+        let row_count = (books_rc.len() + cols - 1) / cols;
+        let app_weak_grid: AnyWeakEntity = cx.entity().downgrade().into();
+
+        v_flex()
+            .size_full()
+            .when_some(continue_book, |col, hero| {
+                col.child(render_continue_reading_hero(&hero, cx))
+            })
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .pt_2()
+                    .child(
+                        uniform_list("library-book-rows", row_count, move |range, _, _| {
+                            range
+                                .map(|row_ix| {
+                                    let start = row_ix * cols;
+                                    let end = (start + cols).min(books_rc.len());
+                                    let mut row = h_flex()
+                                        .w_full()
+                                        .px_3()
+                                        .pb_3()
+                                        .gap_2p5()
+                                        .items_stretch();
+                                    for ix in start..end {
+                                        row = row.child(render_book_card_in_row(
+                                            &books_rc[ix],
+                                            ix,
+                                            app_weak_grid.clone(),
+                                        ));
+                                    }
+                                    for _ in (end - start)..cols {
+                                        row = row.child(div().flex_1());
+                                    }
+                                    row
+                                })
+                                .collect()
+                        })
+                        .size_full()
+                        .track_scroll(&app.library_rows_scroll),
+                    )
+                    .child(Scrollbar::vertical(&app.library_rows_scroll)),
+            )
+            .into_any_element()
     };
 
     v_flex()
@@ -749,15 +799,7 @@ pub fn render_library_tab(
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .child(
-                    div()
-                        .id("library-grid-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&app.library_scroll)
-                        .child(grid),
-                )
-                .child(Scrollbar::vertical(&app.library_scroll)),
+                .child(grid),
         )
 }
 
@@ -954,7 +996,17 @@ pub fn render_book_context_menu(
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close_book_context_menu(cx);
                         })),
+                )
+                .with_animation(
+                    "book-ctx-rise",
+                    Animation::new(Duration::from_millis(210)).with_easing(ease_out_quint()),
+                    |el, t| el.mb(px(-64.0 * (1.0 - t))).opacity(t),
                 ),
+        )
+        .with_animation(
+            "book-ctx-fade",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
         )
         .into_any_element()
 }

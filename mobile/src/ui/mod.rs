@@ -547,7 +547,7 @@ impl ReaderState {
         let anim_x = if let Some(anim) = &self.flip_anim {
             let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
             let raw_t = (elapsed_ms / (anim.duration_ms.max(1) as f32)).clamp(0.0, 1.0);
-            let eased = 1.0 - (1.0 - raw_t).powi(3);
+            let eased = 1.0 - (1.0 - raw_t).powi(4);
             anim.start_x + (anim.target_x - anim.start_x) * eased
         } else {
             0.0
@@ -573,6 +573,7 @@ pub struct BookwormMobileApp {
     pub last_opened_rel: Option<String>,
     pub folder_picker: Option<FolderPickerState>,
     pub book_context_menu: Option<String>,
+    pub opening_book_title: Option<String>,
 
     pub reader_theme: ReaderTheme,
     pub reader_font_size: f32,
@@ -586,6 +587,7 @@ pub struct BookwormMobileApp {
     pub folder_picker_input: Entity<InputState>,
 
     pub library_scroll: ScrollHandle,
+    pub library_rows_scroll: UniformListScrollHandle,
     pub reader_scroll: ScrollHandle,
     pub toc_scroll: ScrollHandle,
     pub notes_scroll: ScrollHandle,
@@ -594,7 +596,11 @@ pub struct BookwormMobileApp {
 
     last_back_at: Option<Instant>,
     last_resume_epoch: u64,
+    open_book_gen: u64,
+    sync_save_gen: u64,
     _library_task: Option<Task<()>>,
+    _open_book_task: Option<Task<()>>,
+    _sync_save_task: Option<Task<()>>,
     _perm_poll_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -910,6 +916,7 @@ impl BookwormMobileApp {
             last_opened_rel: None,
             folder_picker: None,
             book_context_menu: None,
+            opening_book_title: None,
             reader_theme,
             reader_font_size,
             reader_width,
@@ -920,6 +927,7 @@ impl BookwormMobileApp {
             highlight_note_input,
             folder_picker_input,
             library_scroll: ScrollHandle::new(),
+            library_rows_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
             toc_scroll: ScrollHandle::new(),
             notes_scroll: ScrollHandle::new(),
@@ -927,7 +935,11 @@ impl BookwormMobileApp {
             folder_picker_scroll: ScrollHandle::new(),
             last_back_at: None,
             last_resume_epoch: crate::android_resume_epoch(),
+            open_book_gen: 0,
+            sync_save_gen: 0,
             _library_task: None,
+            _open_book_task: None,
+            _sync_save_task: None,
             _perm_poll_task: None,
             _subs: subs,
         };
@@ -1145,7 +1157,7 @@ impl BookwormMobileApp {
         if let Some(book_rec) = self.books.iter_mut().find(|b| b.rel_path == rel_path) {
             book_rec.user = updated;
         }
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(true, cx);
         self.status_banner = Some(format!("Status set to {}", status.label()));
         cx.notify();
     }
@@ -1157,13 +1169,50 @@ impl BookwormMobileApp {
         cx: &mut Context<Self>,
     ) {
         self.book_context_menu = None;
-        self.open_book(rel_path, window, cx);
-        if let Some(r) = &mut self.reader {
-            r.show_notes = true;
-            r.show_toc = false;
-            r.show_settings = false;
-        }
-        cx.notify();
+        self.open_book_with_notes(rel_path, true, window, cx);
+    }
+
+    pub fn schedule_library_sync_save(&mut self, immediate: bool, cx: &mut Context<Self>) {
+        self.sync_save_gen = self.sync_save_gen.wrapping_add(1);
+        let seq = self.sync_save_gen;
+        let delay = if immediate {
+            Duration::from_millis(40)
+        } else {
+            Duration::from_millis(450)
+        };
+        let state_root = self.library_state_root.clone();
+        self._sync_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let snapshot = this
+                .update(cx, |app, _| {
+                    if app.sync_save_gen != seq {
+                        return None;
+                    }
+                    Some(app.library_store.clone())
+                })
+                .ok()
+                .flatten();
+            let Some(mut store) = snapshot else {
+                return;
+            };
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let count = store.sync_save(&state_root)?;
+                    Ok::<(LibraryStore, usize), anyhow::Error>((store, count))
+                })
+                .await;
+            if let Ok((merged_store, conflicts)) = res {
+                let _ = this.update(cx, |app, cx| {
+                    if conflicts > 0 && app.sync_save_gen == seq {
+                        app.library_store.merge_from(merged_store);
+                        app.status_banner =
+                            Some(format!("Merged {conflicts} synced library conflict(s)"));
+                        cx.notify();
+                    }
+                });
+            }
+        }));
     }
 
     pub fn export_single_book_notes(&mut self, rel_path: &str, cx: &mut Context<Self>) {
@@ -1617,9 +1666,17 @@ impl BookwormMobileApp {
             r.current_page = align_page(r.current_page);
         }
 
-        // Warm adjacent chapter pagination lazily so chapter-boundary swipes show real pages.
-        if ch_idx + 1 < r.book.chapters.len() && !r.adjacent_pages_cache.contains_key(&(ch_idx + 1)) {
-            if let Some(next_ch) = r.book.chapters.get(ch_idx + 1) {
+        // Warm adjacent chapter pagination lazily only when near chapter boundaries.
+        r.adjacent_pages_cache
+            .retain(|&k, _| k == ch_idx + 1 || (ch_idx > 0 && k == ch_idx - 1));
+        if !rebuilt {
+            let near_end = r.current_page + step * 2 >= count;
+            let near_start = r.current_page <= step * 2;
+            if near_end
+                && ch_idx + 1 < r.book.chapters.len()
+                && !r.adjacent_pages_cache.contains_key(&(ch_idx + 1))
+                && let Some(next_ch) = r.book.chapters.get(ch_idx + 1)
+            {
                 let next_pages = paginate_chapter_blocks_for_view(
                     &next_ch.blocks,
                     col_wrap_base_w,
@@ -1629,9 +1686,11 @@ impl BookwormMobileApp {
                 );
                 r.adjacent_pages_cache.insert(ch_idx + 1, next_pages);
             }
-        }
-        if ch_idx > 0 && !r.adjacent_pages_cache.contains_key(&(ch_idx - 1)) {
-            if let Some(prev_ch) = r.book.chapters.get(ch_idx - 1) {
+            if near_start
+                && ch_idx > 0
+                && !r.adjacent_pages_cache.contains_key(&(ch_idx - 1))
+                && let Some(prev_ch) = r.book.chapters.get(ch_idx - 1)
+            {
                 let prev_pages = paginate_chapter_blocks_for_view(
                     &prev_ch.blocks,
                     col_wrap_base_w,
@@ -1677,7 +1736,7 @@ impl BookwormMobileApp {
             }
         }
         let pct = self.reader_current_scroll_pct();
-        self.persist_reader_progress(pct);
+        self.persist_reader_progress(pct, cx);
     }
 
     pub fn flush_pending_page_flip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1693,6 +1752,29 @@ impl BookwormMobileApp {
         }
     }
 
+    pub fn finish_page_flip_anim(
+        &mut self,
+        anim_gen: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let step = if let Some(r) = &mut self.reader {
+            if r.flip_anim_gen != anim_gen {
+                return;
+            }
+            let Some(anim) = r.flip_anim.take() else {
+                return;
+            };
+            anim.pending_step
+        } else {
+            return;
+        };
+        if step != 0 {
+            self.apply_page_step(step, window, cx);
+        }
+        cx.notify();
+    }
+
     pub fn reader_start_page_flip_anim(
         &mut self,
         start_x: f32,
@@ -1706,7 +1788,6 @@ impl BookwormMobileApp {
             return;
         };
         r.flip_anim_gen = r.flip_anim_gen.wrapping_add(1);
-        let anim_gen = r.flip_anim_gen;
         r.flip_anim = Some(PageFlipAnimation {
             dir,
             pending_step,
@@ -1717,90 +1798,7 @@ impl BookwormMobileApp {
         });
         r.swipe_offset_x = 0.0;
         r.swipe_active = false;
-        let book_rel = r.book_rel.clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let mut done = true;
-                let mut commit_step: Option<isize> = None;
-                let res = this.update(cx, |app, cx| {
-                    let Some(r) = &mut app.reader else {
-                        return;
-                    };
-                    if r.book_rel != book_rel || r.flip_anim_gen != anim_gen {
-                        return;
-                    }
-                    if let Some(anim) = &r.flip_anim {
-                        if anim.started_at.elapsed().as_millis() as u64 >= anim.duration_ms {
-                            commit_step = Some(anim.pending_step);
-                            r.flip_anim = None;
-                            done = true;
-                        } else {
-                            done = false;
-                        }
-                        cx.notify();
-                    }
-                });
-                if let Some(step) = commit_step
-                    && step != 0
-                {
-                    let _ = this.update(cx, |app, cx| {
-                        // Advance page synchronously without needing Window unless switching chapter;
-                        // chapter transition doesn't require Window other than blur/keyboard which is already hidden.
-                        if let Some(r) = &mut app.reader {
-                            if step > 0 {
-                                let next_p = r.current_page + (step as usize);
-                                let count = r.chapter_pages.len().max(1);
-                                if next_p < count {
-                                    r.current_page = next_p;
-                                    r.clear_selection_and_draft();
-                                } else if r.chapter_idx + 1 < r.book.chapters.len() {
-                                    let next_ch = r.chapter_idx + 1;
-                                    r.chapter_idx = next_ch;
-                                    r.current_page = 0;
-                                    r.pending_last_page = false;
-                                    r.needs_page_recompute = true;
-                                    r.clear_selection_and_draft();
-                                    r.rendered_layouts.borrow_mut().clear();
-                                    app.persist_reader_progress(0.0);
-                                    cx.notify();
-                                    return;
-                                }
-                            } else {
-                                let back = (-step) as usize;
-                                if r.current_page >= back {
-                                    r.current_page -= back;
-                                    r.clear_selection_and_draft();
-                                } else if r.current_page > 0 {
-                                    r.current_page = 0;
-                                    r.clear_selection_and_draft();
-                                } else if r.chapter_idx > 0 {
-                                    let prev_ch = r.chapter_idx - 1;
-                                    r.chapter_idx = prev_ch;
-                                    r.current_page = 0;
-                                    r.pending_last_page = true;
-                                    r.needs_page_recompute = true;
-                                    r.clear_selection_and_draft();
-                                    r.rendered_layouts.borrow_mut().clear();
-                                    app.persist_reader_progress(1.0);
-                                    cx.notify();
-                                    return;
-                                }
-                            }
-                        }
-                        let pct = app.reader_current_scroll_pct();
-                        app.persist_reader_progress(pct);
-                        cx.notify();
-                    });
-                }
-                if res.is_err() || done {
-                    break;
-                }
-            }
-        })
-        .detach();
+        cx.notify();
     }
 
     pub fn reader_next_page_or_chapter(
@@ -1883,7 +1881,7 @@ impl BookwormMobileApp {
         }
     }
 
-    fn persist_reader_progress(&mut self, scroll_pct: f32) {
+    fn persist_reader_progress(&mut self, scroll_pct: f32, cx: &mut Context<Self>) {
         let clamped = scroll_pct.clamp(0.0, 1.0);
         let Some(r) = &mut self.reader else {
             return;
@@ -1902,7 +1900,7 @@ impl BookwormMobileApp {
             already_finished,
         );
         r.last_saved_scroll_pct = clamped;
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(false, cx);
     }
 
     pub fn maybe_schedule_reader_scroll_save(&mut self, cx: &mut Context<Self>) {
@@ -1925,7 +1923,7 @@ impl BookwormMobileApp {
             cx.background_executor()
                 .timer(Duration::from_millis(600))
                 .await;
-            let _ = this.update(cx, |app, _cx| {
+            let _ = this.update(cx, |app, cx| {
                 let cur_now = app.reader_current_scroll_pct();
                 let should_save = if let Some(r) = &mut app.reader {
                     if r.book_rel == book_rel {
@@ -1941,7 +1939,7 @@ impl BookwormMobileApp {
                     false
                 };
                 if should_save {
-                    app.persist_reader_progress(cur_now);
+                    app.persist_reader_progress(cur_now, cx);
                 }
             });
         })
@@ -2059,7 +2057,7 @@ impl BookwormMobileApp {
                     }
                     if app.apply_pending_reader_scroll() {
                         let pct = app.reader_current_scroll_pct();
-                        app.persist_reader_progress(pct);
+                        app.persist_reader_progress(pct, cx);
                         cx.notify();
                         stop = true;
                     } else {
@@ -2075,111 +2073,147 @@ impl BookwormMobileApp {
     }
 
     pub fn open_book(&mut self, rel_path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_book_with_notes(rel_path, false, window, cx);
+    }
+
+    pub fn open_book_with_notes(
+        &mut self,
+        rel_path: &str,
+        open_notes: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(rec) = self.books.iter().find(|b| b.rel_path == rel_path).cloned() else {
             return;
         };
-        let (loaded_store, mut merged_conflicts) =
-            LibraryStore::load_with_conflict_report(&self.library_state_root);
-        if LibraryStore::state_path(&self.library_state_root).is_file() || merged_conflicts > 0 {
-            self.library_store = loaded_store;
-        }
-        let user_state = self
-            .library_store
-            .books
-            .get(&rec.rel_path)
-            .cloned()
-            .unwrap_or_else(|| rec.user.clone());
-        let book = match EpubBook::load(&rec.path) {
-            Ok(b) => b,
-            Err(err) => {
-                self.status_banner = Some(format!("Failed to open EPUB: {err}"));
-                cx.notify();
-                return;
-            }
-        };
-        let max_ch = book.chapters.len().saturating_sub(1);
-        let start_ch = user_state.chapter_idx.min(max_ch);
-        let restored_scroll = user_state.scroll_pct.clamp(0.0, 1.0);
-        let already_finished = user_state.status == ReadingStatus::Finished;
-        let book_title = rec.display_title().to_string();
-        let total = book.chapters.len().max(1);
-        self.library_store.update_progress(
-            &rec.rel_path,
-            start_ch,
-            total,
-            restored_scroll,
-            already_finished,
-        );
-        if let Ok(extra_conflicts) = self.library_store.sync_save(&self.library_state_root) {
-            merged_conflicts += extra_conflicts;
-        }
-        if merged_conflicts > 0 {
-            self.status_banner = Some(format!(
-                "Merged {merged_conflicts} synced library conflict(s)"
-            ));
-        }
-
-        self.reader_scroll.set_offset(point(px(0.), px(0.)));
-        self.notes_scroll.set_offset(point(px(0.), px(0.)));
         window.blur(cx);
         gpui_mobile::hide_keyboard();
-        let pending_scroll_fraction = (restored_scroll > 0.005).then_some(restored_scroll);
-        self.last_opened_rel = Some(rec.rel_path.clone());
-        self.reader = Some(ReaderState {
-            book_rel: rec.rel_path,
-            book_title,
-            book,
-            chapter_idx: start_ch,
-            show_settings: false,
-            show_toc: false,
-            show_notes: false,
-            notes_color_filter: None,
-            notes_only_filter: false,
-            draft: None,
-            draft_sheet_bounds: Rc::new(RefCell::new(None)),
-            settings_strip_bounds: Rc::new(RefCell::new(None)),
-            viewport_bounds: Rc::new(Cell::new(Bounds::default())),
-            chapter_pages: vec![ChapterPage {
-                slices: Vec::new(),
-                show_chapter_header: false,
-            }],
-            adjacent_pages_cache: HashMap::new(),
-            pages_cache_key: None,
-            current_page: 0,
-            pending_last_page: false,
-            needs_page_recompute: true,
-            selection_anchor: None,
-            selection_head: None,
-            is_long_press_selecting: false,
-            dragging_handle: None,
-            mouse_down_pos: None,
-            is_mouse_selecting: false,
-            page_touch_mode: None,
-            page_touch_gen: 0,
-            page_touch_start_x: 0.0,
-            page_touch_cur_pos: Point::default(),
-            page_touch_last_x: 0.0,
-            page_touch_last_at: None,
-            page_touch_vel_x: 0.0,
-            _page_lp_task: None,
-            swipe_offset_x: 0.0,
-            swipe_active: false,
-            swipe_ignore_momentum: false,
-            flip_anim: None,
-            flip_anim_gen: 0,
-            rendered_layouts: Rc::new(RefCell::new(Vec::new())),
-            decoded_images: RefCell::new(HashMap::new()),
-            pending_scroll_block: None,
-            pending_scroll_fraction,
-            scroll_jump_gen: 0,
-            last_saved_scroll_pct: restored_scroll,
-            scroll_save_scheduled: false,
-        });
-        if pending_scroll_fraction.is_some() {
-            self.schedule_pending_reader_scroll(cx);
-        }
-        self.surface = AppSurface::Reader;
+        self.book_context_menu = None;
+        self.opening_book_title = Some(rec.display_title().to_string());
+        self.open_book_gen = self.open_book_gen.wrapping_add(1);
+        let seq = self.open_book_gen;
+        let state_root = self.library_state_root.clone();
         cx.notify();
+
+        self._open_book_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let ep_path = rec.path.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let has_state = LibraryStore::state_path(&state_root).is_file();
+                    let (loaded_store, merged_conflicts) =
+                        LibraryStore::load_with_conflict_report(&state_root);
+                    let book_res = EpubBook::load(&ep_path);
+                    (has_state, loaded_store, merged_conflicts, book_res)
+                })
+                .await;
+
+            let _ = this.update_in(cx, |app, window, cx| {
+                if app.open_book_gen != seq {
+                    return;
+                }
+                app.opening_book_title = None;
+                let (has_state, loaded_store, merged_conflicts, book_res) = loaded;
+                if has_state || merged_conflicts > 0 {
+                    app.library_store.merge_from(loaded_store);
+                }
+                let user_state = app
+                    .library_store
+                    .books
+                    .get(&rec.rel_path)
+                    .cloned()
+                    .unwrap_or_else(|| rec.user.clone());
+                let book = match book_res {
+                    Ok(b) => b,
+                    Err(err) => {
+                        app.status_banner = Some(format!("Failed to open EPUB: {err}"));
+                        cx.notify();
+                        return;
+                    }
+                };
+                let max_ch = book.chapters.len().saturating_sub(1);
+                let start_ch = user_state.chapter_idx.min(max_ch);
+                let restored_scroll = user_state.scroll_pct.clamp(0.0, 1.0);
+                let already_finished = user_state.status == ReadingStatus::Finished;
+                let book_title = rec.display_title().to_string();
+                let total = book.chapters.len().max(1);
+                app.library_store.update_progress(
+                    &rec.rel_path,
+                    start_ch,
+                    total,
+                    restored_scroll,
+                    already_finished,
+                );
+                if merged_conflicts > 0 {
+                    app.status_banner = Some(format!(
+                        "Merged {merged_conflicts} synced library conflict(s)"
+                    ));
+                }
+
+                app.reader_scroll.set_offset(point(px(0.), px(0.)));
+                app.notes_scroll.set_offset(point(px(0.), px(0.)));
+                window.blur(cx);
+                gpui_mobile::hide_keyboard();
+                let pending_scroll_fraction = (restored_scroll > 0.005).then_some(restored_scroll);
+                app.last_opened_rel = Some(rec.rel_path.clone());
+                app.reader = Some(ReaderState {
+                    book_rel: rec.rel_path,
+                    book_title,
+                    book,
+                    chapter_idx: start_ch,
+                    show_settings: false,
+                    show_toc: false,
+                    show_notes: open_notes,
+                    notes_color_filter: None,
+                    notes_only_filter: false,
+                    draft: None,
+                    draft_sheet_bounds: Rc::new(RefCell::new(None)),
+                    settings_strip_bounds: Rc::new(RefCell::new(None)),
+                    viewport_bounds: Rc::new(Cell::new(Bounds::default())),
+                    chapter_pages: vec![ChapterPage {
+                        slices: Vec::new(),
+                        show_chapter_header: false,
+                    }],
+                    adjacent_pages_cache: HashMap::new(),
+                    pages_cache_key: None,
+                    current_page: 0,
+                    pending_last_page: false,
+                    needs_page_recompute: true,
+                    selection_anchor: None,
+                    selection_head: None,
+                    is_long_press_selecting: false,
+                    dragging_handle: None,
+                    mouse_down_pos: None,
+                    is_mouse_selecting: false,
+                    page_touch_mode: None,
+                    page_touch_gen: 0,
+                    page_touch_start_x: 0.0,
+                    page_touch_cur_pos: Point::default(),
+                    page_touch_last_x: 0.0,
+                    page_touch_last_at: None,
+                    page_touch_vel_x: 0.0,
+                    _page_lp_task: None,
+                    swipe_offset_x: 0.0,
+                    swipe_active: false,
+                    swipe_ignore_momentum: false,
+                    flip_anim: None,
+                    flip_anim_gen: 0,
+                    rendered_layouts: Rc::new(RefCell::new(Vec::new())),
+                    decoded_images: RefCell::new(HashMap::new()),
+                    pending_scroll_block: None,
+                    pending_scroll_fraction,
+                    scroll_jump_gen: 0,
+                    last_saved_scroll_pct: restored_scroll,
+                    scroll_save_scheduled: false,
+                });
+                if pending_scroll_fraction.is_some() {
+                    app.schedule_pending_reader_scroll(cx);
+                }
+                app.surface = AppSurface::Reader;
+                app.schedule_library_sync_save(false, cx);
+                cx.notify();
+            });
+        }));
     }
 
     pub fn reader_go_chapter(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2202,7 +2236,7 @@ impl BookwormMobileApp {
             r.pending_scroll_fraction = None;
             r.scroll_jump_gen = r.scroll_jump_gen.wrapping_add(1);
             self.reader_scroll.set_offset(point(px(0.), px(0.)));
-            self.persist_reader_progress(0.0);
+            self.persist_reader_progress(0.0, cx);
             window.blur(cx);
             gpui_mobile::hide_keyboard();
         }
@@ -2236,7 +2270,7 @@ impl BookwormMobileApp {
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
             self.reader_scroll.set_offset(point(px(0.), px(0.)));
-            self.persist_reader_progress(frac);
+            self.persist_reader_progress(frac, cx);
             if self.reader_pagination != ReaderPaginationPref::Page {
                 self.schedule_pending_reader_scroll(cx);
             }
@@ -2267,7 +2301,7 @@ impl BookwormMobileApp {
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
             self.reader_scroll.set_offset(point(px(0.), px(0.)));
-            self.persist_reader_progress(frac);
+            self.persist_reader_progress(frac, cx);
             if self.reader_pagination != ReaderPaginationPref::Page {
                 self.schedule_pending_reader_scroll(cx);
             }
@@ -2408,7 +2442,7 @@ impl BookwormMobileApp {
                     updated_at: now,
                 },
             );
-            let _ = self.library_store.sync_save(&self.library_state_root);
+            self.schedule_library_sync_save(true, cx);
         }
         window.blur(cx);
         gpui_mobile::hide_keyboard();
@@ -2423,7 +2457,7 @@ impl BookwormMobileApp {
                 && let Some(id) = d.existing_id
             {
                 self.library_store.delete_highlight(&r.book_rel, &id);
-                let _ = self.library_store.sync_save(&self.library_state_root);
+                self.schedule_library_sync_save(true, cx);
             }
         }
         window.blur(cx);
@@ -2442,7 +2476,7 @@ impl BookwormMobileApp {
                 .unwrap_or("Chapter");
             self.library_store
                 .toggle_bookmark(&r.book_rel, r.chapter_idx, ch_title, scroll_pct);
-            let _ = self.library_store.sync_save(&self.library_state_root);
+            self.schedule_library_sync_save(true, cx);
         }
         cx.notify();
     }
@@ -2455,7 +2489,7 @@ impl BookwormMobileApp {
             ReaderTheme::Sepia => ReaderThemePref::Sepia,
             ReaderTheme::Paper => ReaderThemePref::Paper,
         };
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(false, cx);
         cx.notify();
     }
 
@@ -2465,7 +2499,7 @@ impl BookwormMobileApp {
         if let Some(r) = &mut self.reader {
             r.needs_page_recompute = true;
         }
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(false, cx);
         cx.notify();
     }
 
@@ -2476,7 +2510,7 @@ impl BookwormMobileApp {
             r.rendered_layouts.borrow_mut().clear();
             r.needs_page_recompute = true;
         }
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(false, cx);
         cx.notify();
     }
 
@@ -2496,7 +2530,7 @@ impl BookwormMobileApp {
         if self.reader_pagination == ReaderPaginationPref::Scroll {
             self.schedule_pending_reader_scroll(cx);
         }
-        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.schedule_library_sync_save(false, cx);
         cx.notify();
     }
 
@@ -2521,7 +2555,8 @@ impl BookwormMobileApp {
         });
         if should_save {
             let pct = self.reader_current_scroll_pct();
-            self.persist_reader_progress(pct);
+            self.persist_reader_progress(pct, cx);
+            self.schedule_library_sync_save(true, cx);
         }
         if let Some(r) = &self.reader
             && let Some(book_rec) = self.books.iter_mut().find(|b| b.rel_path == r.book_rel)
@@ -2695,6 +2730,42 @@ impl Render for BookwormMobileApp {
                     })
                     .when(self.book_context_menu.is_some(), |frame| {
                         frame.child(library_view::render_book_context_menu(self, cx))
+                    })
+                    .when_some(self.opening_book_title.clone(), |frame, title| {
+                        frame.child(
+                            div()
+                                .id("lib-opening-pill")
+                                .absolute()
+                                .inset_0()
+                                .bg(crate::theme::hex_alpha(0x0000005a))
+                                .occlude()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .p_6()
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_3()
+                                        .rounded(px(14.))
+                                        .bg(crate::theme::hex_color(crate::theme::kd::BG_SIDEBAR))
+                                        .border_1()
+                                        .border_color(crate::theme::hex_color(
+                                            crate::theme::kd::BORDER,
+                                        ))
+                                        .shadow_lg()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(crate::theme::hex_color(crate::theme::kd::FG))
+                                        .child(format!("Opening {title}…")),
+                                )
+                                .with_animation(
+                                    "lib-opening-fade",
+                                    Animation::new(Duration::from_millis(140))
+                                        .with_easing(ease_out_quint()),
+                                    |el, t| el.opacity(t),
+                                ),
+                        )
                     })
                     .when(self.folder_picker.is_some(), |frame| {
                         frame.child(settings_view::render_folder_picker_modal(
