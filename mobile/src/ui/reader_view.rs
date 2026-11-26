@@ -1,5 +1,7 @@
 use super::image_util::decode_bytes_image;
-use super::{BookwormMobileApp, PageTouchMode, ReaderState, SelectionHandleKind};
+use super::{
+    BookwormMobileApp, PageTouchMode, ReaderState, SelectionHandleKind, SliceRenderKey,
+};
 use crate::theme::{ReaderPalette, ReaderTheme, hex_alpha, hex_color};
 use bookworm_core::epub::{EpubBlock, EpubRun};
 use bookworm_core::library::{
@@ -200,8 +202,37 @@ fn render_paragraph_text(
     code_fg: Hsla,
     sel_bg: Hsla,
     light_paper: bool,
+    highlights_epoch: u64,
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
+    slice_cache:
+        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
 ) -> AnyElement {
+    let cache_key = slice.filter(|_| sel_range.is_none()).map(|sl| {
+        (
+            chapter_idx,
+            blk_idx,
+            sl.byte_range.start,
+            sl.byte_range.end,
+            light_paper,
+            highlights_epoch,
+        )
+    });
+    if let Some(ck) = cache_key
+        && let Some((cached_text, cached_flat)) = slice_cache.borrow().get(&ck)
+    {
+        let disp_len = cached_text.len();
+        let st = if cached_flat.is_empty() {
+            StyledText::new(cached_text.clone())
+        } else {
+            StyledText::new(cached_text.clone()).with_highlights(cached_flat.clone())
+        };
+        if let Some(slot) = rendered_layouts {
+            slot.borrow_mut()
+                .push((blk_idx, ck.2, disp_len, st.layout().clone()));
+        }
+        return st.into_any_element();
+    }
+
     let full_len = text.len();
     let (base_off, disp_text, shifted_runs, shifted_sel): (
         usize,
@@ -257,10 +288,18 @@ fn render_paragraph_text(
         sel_bg,
         light_paper,
     );
+    let disp_shared = SharedString::from(disp_text);
+    if let Some(ck) = cache_key {
+        let mut cache = slice_cache.borrow_mut();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(ck, (disp_shared.clone(), flat.clone()));
+    }
     let st = if flat.is_empty() {
-        StyledText::new(disp_text)
+        StyledText::new(disp_shared)
     } else {
-        StyledText::new(disp_text).with_highlights(flat)
+        StyledText::new(disp_shared).with_highlights(flat)
     };
     if let Some(slot) = rendered_layouts {
         slot.borrow_mut()
@@ -281,7 +320,10 @@ fn render_chapter_block(
     pal: ReaderPalette,
     light_paper: bool,
     highlights: &[BookHighlight],
+    highlights_epoch: u64,
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
+    slice_cache:
+        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
     decoded_images: &RefCell<HashMap<(usize, usize), Arc<Image>>>,
 ) -> AnyElement {
     let code_bg = hex_color(pal.surface);
@@ -313,7 +355,9 @@ fn render_chapter_block(
                 code_fg,
                 sel_bg,
                 light_paper,
+                highlights_epoch,
                 rendered_layouts,
+                slice_cache,
             );
             div()
                 .id(SharedString::from(format!("blk-{b_ix}-{}", is_cont as u8)))
@@ -344,7 +388,9 @@ fn render_chapter_block(
                 code_fg,
                 sel_bg,
                 light_paper,
+                highlights_epoch,
                 rendered_layouts,
+                slice_cache,
             );
             div()
                 .id(SharedString::from(format!("blk-{b_ix}-{}", is_cont as u8)))
@@ -379,7 +425,9 @@ fn render_chapter_block(
                 code_fg,
                 sel_bg,
                 light_paper,
+                highlights_epoch,
                 rendered_layouts,
+                slice_cache,
             );
             h_flex()
                 .id(SharedString::from(format!("blk-{b_ix}-{}", is_cont as u8)))
@@ -454,8 +502,11 @@ fn render_page_spread_canvas(
     pal: ReaderPalette,
     light_paper: bool,
     highlights: &[BookHighlight],
+    highlights_epoch: u64,
     selection_bounds: &[Option<Range<usize>>],
     rendered_layouts: Option<&Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>>,
+    slice_cache:
+        &RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
     decoded_images: &RefCell<HashMap<(usize, usize), Arc<Image>>>,
 ) -> AnyElement {
     let build_col = |pg_opt: Option<&ChapterPage>| {
@@ -479,7 +530,9 @@ fn render_page_spread_canvas(
                         pal,
                         light_paper,
                         highlights,
+                        highlights_epoch,
                         rendered_layouts,
+                        slice_cache,
                         decoded_images,
                     ));
                 }
@@ -547,6 +600,18 @@ pub fn render_reader_view(
     let use_two_col = app.two_column_spread && wide_viewport;
     let width_pref = app.reader_width;
 
+    if let Some((anim_gen, done)) = app.reader.as_ref().and_then(|r| {
+        r.flip_anim.as_ref().map(|a| {
+            (
+                r.flip_anim_gen,
+                a.started_at.elapsed().as_millis() as u64 >= a.duration_ms,
+            )
+        })
+    }) && done
+    {
+        app.finish_page_flip_anim(anim_gen, window, cx);
+    }
+
     let should_pag = app
         .reader
         .as_ref()
@@ -561,6 +626,7 @@ pub fn render_reader_view(
         let vp_h = f32::from(vp_b.size.height);
         if vp_w > 100.0 && vp_h > 100.0 {
             app.ensure_reader_pages_and_sync(vp_w, vp_h, use_two_col, window);
+            app.maybe_schedule_adjacent_prepag(vp_w, vp_h, use_two_col, window, cx);
         } else {
             let entity = cx.entity().clone();
             window.on_next_frame(move |_, cx| {
@@ -568,7 +634,6 @@ pub fn render_reader_view(
             });
         }
     }
-    app.maybe_schedule_reader_scroll_save(cx);
 
     let col_max_w = if use_two_col {
         Some(1140.0)
@@ -615,10 +680,13 @@ pub fn render_reader_view(
         *draft_sheet_bounds_ref.borrow_mut() = None;
     }
     let rendered_layouts = &r.rendered_layouts;
+    let slice_cache = &r.slice_render_cache;
+    let highlights_epoch = r.highlights_epoch;
     let decoded_images = &r.decoded_images;
     let vp_slot = r.viewport_bounds.clone();
     let vp_bounds = r.viewport_bounds.get();
     let visual_swipe_x = r.visual_swipe_offset_x();
+    let is_anim_or_swipe = r.flip_anim.is_some() || r.swipe_active;
     let is_long_pressing = r.is_long_press_selecting;
     let handle_points = if !*show_toc && !*show_notes && !is_long_pressing {
         r.selection_handle_points(vp_bounds)
@@ -630,35 +698,39 @@ pub fn render_reader_view(
         let cp = r.current_page.min(tp - 1);
         (cp, tp)
     };
-    let selection_bounds: Vec<Option<Range<usize>>> = book
-        .chapters
-        .get(ch_idx)
-        .map(|c| {
-            c.blocks
-                .iter()
-                .enumerate()
-                .map(|(ix, b)| {
-                    super::block_plain_text(b)
-                        .and_then(|t| r.block_selection_range(ix, t.len()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let selection_bounds: Vec<Option<Range<usize>>> = if r.normalized_selection().is_some() {
+        book.chapters
+            .get(ch_idx)
+            .map(|c| {
+                c.blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, b)| {
+                        super::block_plain_text(b)
+                            .and_then(|t| r.block_selection_range(ix, t.len()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let pal = app.reader_theme.palette();
     let light_paper = matches!(app.reader_theme, ReaderTheme::Sepia | ReaderTheme::Paper);
-    let user_state = app
-        .library_store
-        .books
-        .get(book_rel)
-        .cloned()
-        .unwrap_or_default();
+    let user_state_opt = app.library_store.books.get(book_rel);
+    let highlights: &[BookHighlight] = user_state_opt
+        .map(|u| u.highlights.as_slice())
+        .unwrap_or(&[]);
+    let bookmarks: &[bookworm_core::library::BookBookmark] = user_state_opt
+        .map(|u| u.bookmarks.as_slice())
+        .unwrap_or(&[]);
     let chapter = book.chapters.get(ch_idx);
     let ch_title = chapter
         .map(|c| c.title.clone())
         .unwrap_or_else(|| book_title.clone());
-    let is_bookmarked = user_state.bookmarks.iter().any(|b| b.chapter_idx == ch_idx);
-    let ann_count = user_state.highlights.len() + user_state.bookmarks.len();
+    let is_bookmarked = bookmarks.iter().any(|b| b.chapter_idx == ch_idx);
+    let ann_count = highlights.len() + bookmarks.len();
 
     let top_bar = h_flex()
         .w_full()
@@ -991,8 +1063,7 @@ pub fn render_reader_view(
     } else if *show_notes {
         let active_color_filter = *notes_color_filter;
         let active_notes_only = *notes_only_filter;
-        let mut filtered_hls: Vec<BookHighlight> = user_state
-            .highlights
+        let mut filtered_hls: Vec<BookHighlight> = highlights
             .iter()
             .filter(|h| {
                 if let Some(col) = active_color_filter
@@ -1097,11 +1168,11 @@ pub fn render_reader_view(
                                     .text_color(hex_color(pal.fg))
                                     .child(format!("Highlights, Notes & Bookmarks · {ann_count}")),
                             )
-                            .when(!user_state.highlights.is_empty(), |col| {
+                            .when(!highlights.is_empty(), |col| {
                                 col.child(filter_bar)
                             })
                             .when(
-                                user_state.highlights.is_empty() && user_state.bookmarks.is_empty(),
+                                highlights.is_empty() && bookmarks.is_empty(),
                                 |col| {
                                     col.child(
                                         div()
@@ -1115,9 +1186,9 @@ pub fn render_reader_view(
                                 },
                             )
                             .when(
-                                !user_state.highlights.is_empty()
+                                !highlights.is_empty()
                                     && filtered_hls.is_empty()
-                                    && user_state.bookmarks.is_empty(),
+                                    && bookmarks.is_empty(),
                                 |col| {
                                     col.child(
                                         div()
@@ -1130,7 +1201,7 @@ pub fn render_reader_view(
                                     )
                                 },
                             )
-                            .children(user_state.bookmarks.iter().enumerate().map(|(ix, bm)| {
+                            .children(bookmarks.iter().enumerate().map(|(ix, bm)| {
                                 let bm_jump = bm.clone();
                                 let bm_del_id = bm.id.clone();
                                 let bm_rel_key = book_rel.clone();
@@ -1242,6 +1313,11 @@ pub fn render_reader_view(
                                                     cx.stop_propagation();
                                                     this.library_store
                                                         .delete_highlight(&rel_key, &hl_id);
+                                                    if let Some(r) = &mut this.reader {
+                                                        r.highlights_epoch =
+                                                            r.highlights_epoch.wrapping_add(1);
+                                                        r.slice_render_cache.borrow_mut().clear();
+                                                    }
                                                     this.schedule_library_sync_save(true, cx);
                                                     cx.notify();
                                                 })),
@@ -1275,7 +1351,10 @@ pub fn render_reader_view(
             )
             .into_any_element()
     } else {
-        rendered_layouts.borrow_mut().clear();
+        let active_layouts = (!is_anim_or_swipe).then_some(rendered_layouts);
+        if !is_anim_or_swipe {
+            rendered_layouts.borrow_mut().clear();
+        }
         let vp_w_cur = f32::from(vp_bounds.size.width).max(300.0);
         let vp_h_cur = f32::from(vp_bounds.size.height).max(200.0);
         let max_img_h = (vp_h_cur - 32.0) * 0.68;
@@ -1299,9 +1378,11 @@ pub fn render_reader_view(
                 app.reader_font_size,
                 pal,
                 light_paper,
-                &user_state.highlights,
+                highlights,
+                highlights_epoch,
                 &selection_bounds,
-                Some(rendered_layouts),
+                active_layouts,
+                slice_cache,
                 decoded_images,
             );
 
@@ -1321,9 +1402,11 @@ pub fn render_reader_view(
                         app.reader_font_size,
                         pal,
                         light_paper,
-                        &user_state.highlights,
+                        highlights,
+                        highlights_epoch,
                         &[],
                         None,
+                        slice_cache,
                         decoded_images,
                     ))
                 } else if ch_idx + 1 < book.chapters.len() {
@@ -1347,9 +1430,11 @@ pub fn render_reader_view(
                         app.reader_font_size,
                         pal,
                         light_paper,
-                        &user_state.highlights,
+                        highlights,
+                        highlights_epoch,
                         &[],
                         None,
+                        slice_cache,
                         decoded_images,
                     ))
                 } else {
@@ -1370,9 +1455,11 @@ pub fn render_reader_view(
                         app.reader_font_size,
                         pal,
                         light_paper,
-                        &user_state.highlights,
+                        highlights,
+                        highlights_epoch,
                         &[],
                         None,
+                        slice_cache,
                         decoded_images,
                     ))
                 } else if ch_idx > 0 {
@@ -1400,9 +1487,11 @@ pub fn render_reader_view(
                         app.reader_font_size,
                         pal,
                         light_paper,
-                        &user_state.highlights,
+                        highlights,
+                        highlights_epoch,
                         &[],
                         None,
+                        slice_cache,
                         decoded_images,
                     ))
                 } else {
@@ -2319,5 +2408,17 @@ mod tests {
         ];
         let idx = split_blocks_two_columns(&blocks);
         assert!((1..blocks.len()).contains(&idx));
+    }
+
+    #[test]
+    fn adjacent_chapter_retention_keeps_two_chapter_radius() {
+        let mut cache = std::collections::HashMap::new();
+        for ch in 0..8usize {
+            cache.insert(ch, ch);
+        }
+        super::super::retain_adjacent_chapters(&mut cache, 4);
+        let mut kept: Vec<usize> = cache.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![2, 3, 4, 5, 6]);
     }
 }

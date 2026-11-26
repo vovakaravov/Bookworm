@@ -143,6 +143,22 @@ pub struct HighlightEditorDraft {
     pub style: HighlightDecoration,
 }
 
+pub type ReaderLayoutKey = (u32, u32, u32, u8, bool);
+pub type SliceRenderKey = (usize, usize, usize, usize, bool, u64);
+
+pub struct PendingChapterPagination {
+    pub ch_idx: usize,
+    pub layout_key: ReaderLayoutKey,
+    pub next_block: usize,
+    pub measured: Vec<MeasuredBlock>,
+}
+
+pub(crate) fn retain_adjacent_chapters<V>(cache: &mut HashMap<usize, V>, ch_idx: usize) {
+    let min_keep = ch_idx.saturating_sub(2);
+    let max_keep = ch_idx.saturating_add(2);
+    cache.retain(|&k, _| (min_keep..=max_keep).contains(&k));
+}
+
 pub struct ReaderState {
     pub book_rel: String,
     pub book_title: String,
@@ -161,7 +177,10 @@ pub struct ReaderState {
     pub viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub chapter_pages: Vec<ChapterPage>,
     pub adjacent_pages_cache: HashMap<usize, Vec<ChapterPage>>,
-    pub pages_cache_key: Option<(usize, u32, u32, u32, u8, bool)>,
+    pub pages_layout_key: Option<ReaderLayoutKey>,
+    pub pages_chapter_idx: Option<usize>,
+    pub pending_prepag: Option<PendingChapterPagination>,
+    pub prepag_scheduled: bool,
     pub current_page: usize,
     pub pending_last_page: bool,
     pub needs_page_recompute: bool,
@@ -186,11 +205,13 @@ pub struct ReaderState {
     pub flip_anim_gen: u64,
     /// `(block_idx, byte_base, slice_len, TextLayout)` for currently interactive page/viewport.
     pub rendered_layouts: Rc<RefCell<Vec<(usize, usize, usize, TextLayout)>>>,
+    pub highlights_epoch: u64,
+    pub slice_render_cache:
+        RefCell<HashMap<SliceRenderKey, (SharedString, Vec<(Range<usize>, HighlightStyle)>)>>,
     pub decoded_images: RefCell<HashMap<(usize, usize), Arc<Image>>>,
     pub pending_scroll_block: Option<(usize, usize)>,
     pub pending_scroll_fraction: Option<f32>,
     pub last_saved_scroll_pct: f32,
-    pub scroll_save_scheduled: bool,
 }
 
 impl ReaderState {
@@ -714,6 +735,97 @@ pub fn shape_block_line_ranges(
     ranges
 }
 
+pub fn measure_chapter_block(
+    b_ix: usize,
+    blk: &EpubBlock,
+    col_wrap_base_w: f32,
+    page_content_h: f32,
+    font_size: f32,
+    base_style: &TextStyle,
+    window: &Window,
+) -> MeasuredBlock {
+    match blk {
+        EpubBlock::Heading { level, text } => {
+            let size = match level {
+                1 => (font_size + 7.0).min(34.0),
+                2 => (font_size + 4.5).min(30.0),
+                _ => (font_size + 2.0).min(26.0),
+            };
+            let lh = (size * 1.28).ceil();
+            let line_ranges = shape_block_line_ranges(
+                text,
+                size,
+                col_wrap_base_w,
+                base_style,
+                true,
+                &[],
+                window,
+            );
+            MeasuredBlock::Text {
+                block_idx: b_ix,
+                line_ranges,
+                line_height: lh,
+                pad_top: 8.0,
+                pad_bottom: 4.0,
+                is_heading: true,
+            }
+        }
+        EpubBlock::Paragraph {
+            text,
+            runs,
+            is_quote,
+        } => {
+            let lh = (font_size * 1.62).ceil();
+            let h_pad = if *is_quote { 20.0 } else { 12.0 };
+            let line_ranges = shape_block_line_ranges(
+                text,
+                font_size,
+                (col_wrap_base_w - h_pad).max(60.0),
+                base_style,
+                false,
+                runs,
+                window,
+            );
+            MeasuredBlock::Text {
+                block_idx: b_ix,
+                line_ranges,
+                line_height: lh,
+                pad_top: 4.0,
+                pad_bottom: 4.0,
+                is_heading: false,
+            }
+        }
+        EpubBlock::ListItem { text, runs } => {
+            let lh = (font_size * 1.58).ceil();
+            let line_ranges = shape_block_line_ranges(
+                text,
+                font_size,
+                (col_wrap_base_w - 28.0).max(60.0),
+                base_style,
+                false,
+                runs,
+                window,
+            );
+            MeasuredBlock::Text {
+                block_idx: b_ix,
+                line_ranges,
+                line_height: lh,
+                pad_top: 2.0,
+                pad_bottom: 2.0,
+                is_heading: false,
+            }
+        }
+        EpubBlock::Image { .. } => MeasuredBlock::Fixed {
+            block_idx: b_ix,
+            height: 220.0_f32.min((page_content_h * 0.68).max(120.0)) + 16.0,
+        },
+        EpubBlock::Rule => MeasuredBlock::Fixed {
+            block_idx: b_ix,
+            height: 17.0,
+        },
+    }
+}
+
 pub fn paginate_chapter_blocks_for_view(
     blocks: &[EpubBlock],
     col_wrap_base_w: f32,
@@ -724,90 +836,15 @@ pub fn paginate_chapter_blocks_for_view(
     let base_style = window.text_style();
     let mut measured = Vec::with_capacity(blocks.len());
     for (b_ix, blk) in blocks.iter().enumerate() {
-        match blk {
-            EpubBlock::Heading { level, text } => {
-                let size = match level {
-                    1 => (font_size + 7.0).min(34.0),
-                    2 => (font_size + 4.5).min(30.0),
-                    _ => (font_size + 2.0).min(26.0),
-                };
-                let lh = (size * 1.28).ceil();
-                let line_ranges = shape_block_line_ranges(
-                    text,
-                    size,
-                    col_wrap_base_w,
-                    &base_style,
-                    true,
-                    &[],
-                    window,
-                );
-                measured.push(MeasuredBlock::Text {
-                    block_idx: b_ix,
-                    line_ranges,
-                    line_height: lh,
-                    pad_top: 8.0,
-                    pad_bottom: 4.0,
-                    is_heading: true,
-                });
-            }
-            EpubBlock::Paragraph {
-                text,
-                runs,
-                is_quote,
-            } => {
-                let lh = (font_size * 1.62).ceil();
-                let h_pad = if *is_quote { 20.0 } else { 12.0 };
-                let line_ranges = shape_block_line_ranges(
-                    text,
-                    font_size,
-                    (col_wrap_base_w - h_pad).max(60.0),
-                    &base_style,
-                    false,
-                    runs,
-                    window,
-                );
-                measured.push(MeasuredBlock::Text {
-                    block_idx: b_ix,
-                    line_ranges,
-                    line_height: lh,
-                    pad_top: 4.0,
-                    pad_bottom: 4.0,
-                    is_heading: false,
-                });
-            }
-            EpubBlock::ListItem { text, runs } => {
-                let lh = (font_size * 1.58).ceil();
-                let line_ranges = shape_block_line_ranges(
-                    text,
-                    font_size,
-                    (col_wrap_base_w - 28.0).max(60.0),
-                    &base_style,
-                    false,
-                    runs,
-                    window,
-                );
-                measured.push(MeasuredBlock::Text {
-                    block_idx: b_ix,
-                    line_ranges,
-                    line_height: lh,
-                    pad_top: 2.0,
-                    pad_bottom: 2.0,
-                    is_heading: false,
-                });
-            }
-            EpubBlock::Image { .. } => {
-                measured.push(MeasuredBlock::Fixed {
-                    block_idx: b_ix,
-                    height: 220.0_f32.min((page_content_h * 0.68).max(120.0)) + 16.0,
-                });
-            }
-            EpubBlock::Rule => {
-                measured.push(MeasuredBlock::Fixed {
-                    block_idx: b_ix,
-                    height: 17.0,
-                });
-            }
-        }
+        measured.push(measure_chapter_block(
+            b_ix,
+            blk,
+            col_wrap_base_w,
+            page_content_h,
+            font_size,
+            &base_style,
+            window,
+        ));
     }
     paginate_measured_blocks(&measured, page_content_h, 0.0, 14.0)
 }
@@ -1234,7 +1271,7 @@ impl BookwormMobileApp {
         let delay = if immediate {
             Duration::from_millis(40)
         } else {
-            Duration::from_millis(450)
+            Duration::from_millis(2500)
         };
         let state_root = self.library_state_root.clone();
         self._sync_save_task = Some(cx.spawn(async move |this, cx| {
@@ -1619,7 +1656,30 @@ impl BookwormMobileApp {
         let Some(r) = &mut self.reader else {
             return;
         };
-        if r.pages_cache_key.is_some()
+        let ch_idx = r.chapter_idx.min(r.book.chapters.len().saturating_sub(1));
+        let layout_key: ReaderLayoutKey = (
+            vp_w.round() as u32,
+            vp_h.round() as u32,
+            (font_size * 10.0).round() as u32,
+            width_pref as u8,
+            two_col,
+        );
+        let same_layout = r.pages_layout_key == Some(layout_key);
+        let layout_ready_for_ch =
+            same_layout && r.pages_chapter_idx == Some(ch_idx) && !r.needs_page_recompute;
+
+        if r.pages_layout_key.is_some()
+            && layout_ready_for_ch
+            && (r.draft.is_some()
+                || r.is_long_press_selecting
+                || r.dragging_handle.is_some()
+                || r.page_touch_mode.is_some()
+                || r.flip_anim.is_some()
+                || r.swipe_active)
+        {
+            return;
+        }
+        if r.pages_layout_key.is_some()
             && (r.draft.is_some()
                 || r.is_long_press_selecting
                 || r.dragging_handle.is_some()
@@ -1627,19 +1687,18 @@ impl BookwormMobileApp {
         {
             return;
         }
-        let ch_idx = r.chapter_idx.min(r.book.chapters.len().saturating_sub(1));
-        let key = (
-            ch_idx,
-            vp_w.round() as u32,
-            vp_h.round() as u32,
-            (font_size * 10.0).round() as u32,
-            width_pref as u8,
-            two_col,
-        );
 
-        let rebuilt = r.needs_page_recompute || r.pages_cache_key != Some(key);
+        if !same_layout {
+            r.adjacent_pages_cache.clear();
+            r.pending_prepag = None;
+            r.prepag_scheduled = false;
+            r.slice_render_cache.borrow_mut().clear();
+        }
+
+        let rebuilt = r.needs_page_recompute || !same_layout || r.pages_chapter_idx != Some(ch_idx);
         let prev_anchor = if rebuilt
-            && r.pages_cache_key.is_some_and(|k| k.0 == ch_idx)
+            && same_layout
+            && r.pages_chapter_idx == Some(ch_idx)
             && r.pending_scroll_block.is_none()
             && r.pending_scroll_fraction.is_none()
             && !r.pending_last_page
@@ -1652,7 +1711,46 @@ impl BookwormMobileApp {
             None
         };
         if rebuilt {
-            let pages = if let Some(ch) = r.book.chapters.get(ch_idx) {
+            if same_layout
+                && let Some(old_ch) = r.pages_chapter_idx
+                && old_ch != ch_idx
+                && !r.chapter_pages.is_empty()
+            {
+                r.adjacent_pages_cache
+                    .insert(old_ch, std::mem::take(&mut r.chapter_pages));
+            }
+            let pages = if same_layout
+                && let Some(cached) = r.adjacent_pages_cache.remove(&ch_idx)
+            {
+                cached
+            } else if let Some(mut pending) = r
+                .pending_prepag
+                .take()
+                .filter(|p| p.ch_idx == ch_idx && p.layout_key == layout_key)
+            {
+                if let Some(ch) = r.book.chapters.get(ch_idx) {
+                    let base_style = window.text_style();
+                    for b_ix in pending.next_block..ch.blocks.len() {
+                        if let Some(blk) = ch.blocks.get(b_ix) {
+                            pending.measured.push(measure_chapter_block(
+                                b_ix,
+                                blk,
+                                col_wrap_base_w,
+                                page_content_h,
+                                font_size,
+                                &base_style,
+                                window,
+                            ));
+                        }
+                    }
+                    paginate_measured_blocks(&pending.measured, page_content_h, 0.0, 14.0)
+                } else {
+                    vec![ChapterPage {
+                        slices: Vec::new(),
+                        show_chapter_header: false,
+                    }]
+                }
+            } else if let Some(ch) = r.book.chapters.get(ch_idx) {
                 paginate_chapter_blocks_for_view(
                     &ch.blocks,
                     col_wrap_base_w,
@@ -1667,8 +1765,8 @@ impl BookwormMobileApp {
                 }]
             };
             r.chapter_pages = pages;
-            r.adjacent_pages_cache.clear();
-            r.pages_cache_key = Some(key);
+            r.pages_layout_key = Some(layout_key);
+            r.pages_chapter_idx = Some(ch_idx);
             r.needs_page_recompute = false;
         }
 
@@ -1696,40 +1794,146 @@ impl BookwormMobileApp {
             r.current_page = align_page(r.current_page);
         }
 
-        // Warm adjacent chapter pagination lazily only when near chapter boundaries.
-        r.adjacent_pages_cache
-            .retain(|&k, _| k == ch_idx + 1 || (ch_idx > 0 && k == ch_idx - 1));
-        if !rebuilt {
-            let near_end = r.current_page + step * 2 >= count;
-            let near_start = r.current_page <= step * 2;
-            if near_end
-                && ch_idx + 1 < r.book.chapters.len()
-                && !r.adjacent_pages_cache.contains_key(&(ch_idx + 1))
-                && let Some(next_ch) = r.book.chapters.get(ch_idx + 1)
-            {
-                let next_pages = paginate_chapter_blocks_for_view(
-                    &next_ch.blocks,
+        retain_adjacent_chapters(&mut r.adjacent_pages_cache, ch_idx);
+    }
+
+    pub fn maybe_schedule_adjacent_prepag(
+        &mut self,
+        vp_w: f32,
+        vp_h: f32,
+        two_col: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if vp_w < 100.0 || vp_h < 100.0 {
+            return;
+        }
+        let width_pref = self.reader_width;
+        let font_size = self.reader_font_size;
+        let layout_key: ReaderLayoutKey = (
+            vp_w.round() as u32,
+            vp_h.round() as u32,
+            (font_size * 10.0).round() as u32,
+            width_pref as u8,
+            two_col,
+        );
+        let Some(r) = &mut self.reader else {
+            return;
+        };
+        if r.flip_anim.is_some()
+            || r.swipe_active
+            || r.page_touch_mode.is_some()
+            || r.show_toc
+            || r.show_notes
+            || r.prepag_scheduled
+            || r.pages_layout_key != Some(layout_key)
+        {
+            return;
+        }
+        let ch_idx = r.chapter_idx.min(r.book.chapters.len().saturating_sub(1));
+        let count = r.chapter_pages.len().max(1);
+        let step = if two_col { 2usize } else { 1usize };
+        let near_end = r.current_page + step * 3 >= count;
+        let near_start = r.current_page <= step * 2;
+        let target_ch = if near_end
+            && ch_idx + 1 < r.book.chapters.len()
+            && !r.adjacent_pages_cache.contains_key(&(ch_idx + 1))
+        {
+            Some(ch_idx + 1)
+        } else if near_start && ch_idx > 0 && !r.adjacent_pages_cache.contains_key(&(ch_idx - 1)) {
+            Some(ch_idx - 1)
+        } else {
+            None
+        };
+        let Some(target) = target_ch else {
+            return;
+        };
+        let same_pending = r
+            .pending_prepag
+            .as_ref()
+            .is_some_and(|p| p.ch_idx == target && p.layout_key == layout_key);
+        if !same_pending {
+            let cap = r
+                .book
+                .chapters
+                .get(target)
+                .map(|c| c.blocks.len())
+                .unwrap_or(0);
+            r.pending_prepag = Some(PendingChapterPagination {
+                ch_idx: target,
+                layout_key,
+                next_block: 0,
+                measured: Vec::with_capacity(cap),
+            });
+        }
+        r.prepag_scheduled = true;
+        let entity = cx.entity().clone();
+        window.on_next_frame(move |window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.step_adjacent_prepag(window, cx);
+            });
+        });
+    }
+
+    pub fn step_adjacent_prepag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let font_size = self.reader_font_size;
+        let width_pref = self.reader_width;
+        let Some(r) = &mut self.reader else {
+            return;
+        };
+        r.prepag_scheduled = false;
+        if r.flip_anim.is_some()
+            || r.swipe_active
+            || r.page_touch_mode.is_some()
+            || r.show_toc
+            || r.show_notes
+        {
+            return;
+        }
+        let Some(mut pending) = r.pending_prepag.take() else {
+            return;
+        };
+        if r.pages_layout_key != Some(pending.layout_key) {
+            return;
+        }
+        let (vp_w, vp_h, _, _, two_col) = pending.layout_key;
+        let (_, col_wrap_base_w, page_content_h) =
+            reader_column_metrics(vp_w as f32, vp_h as f32, width_pref, two_col);
+        let Some(ch) = r.book.chapters.get(pending.ch_idx) else {
+            return;
+        };
+        let base_style = window.text_style();
+        let started = Instant::now();
+        while pending.next_block < ch.blocks.len() {
+            if let Some(blk) = ch.blocks.get(pending.next_block) {
+                pending.measured.push(measure_chapter_block(
+                    pending.next_block,
+                    blk,
                     col_wrap_base_w,
                     page_content_h,
                     font_size,
+                    &base_style,
                     window,
-                );
-                r.adjacent_pages_cache.insert(ch_idx + 1, next_pages);
+                ));
             }
-            if near_start
-                && ch_idx > 0
-                && !r.adjacent_pages_cache.contains_key(&(ch_idx - 1))
-                && let Some(prev_ch) = r.book.chapters.get(ch_idx - 1)
-            {
-                let prev_pages = paginate_chapter_blocks_for_view(
-                    &prev_ch.blocks,
-                    col_wrap_base_w,
-                    page_content_h,
-                    font_size,
-                    window,
-                );
-                r.adjacent_pages_cache.insert(ch_idx - 1, prev_pages);
+            pending.next_block += 1;
+            if started.elapsed() >= Duration::from_millis(5) {
+                break;
             }
+        }
+        if pending.next_block >= ch.blocks.len() {
+            let pages = paginate_measured_blocks(&pending.measured, page_content_h, 0.0, 14.0);
+            r.adjacent_pages_cache.insert(pending.ch_idx, pages);
+            retain_adjacent_chapters(&mut r.adjacent_pages_cache, r.chapter_idx);
+        } else {
+            r.pending_prepag = Some(pending);
+            r.prepag_scheduled = true;
+            let entity = cx.entity().clone();
+            window.on_next_frame(move |window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.step_adjacent_prepag(window, cx);
+                });
+            });
         }
     }
 
@@ -1915,49 +2119,6 @@ impl BookwormMobileApp {
         self.schedule_library_sync_save(false, cx);
     }
 
-    pub fn maybe_schedule_reader_scroll_save(&mut self, cx: &mut Context<Self>) {
-        let cur = self.reader_current_scroll_pct();
-        let Some(r) = &mut self.reader else {
-            return;
-        };
-        if r.show_toc
-            || r.show_notes
-            || r.scroll_save_scheduled
-            || r.pending_scroll_block.is_some()
-            || r.pending_scroll_fraction.is_some()
-            || (cur - r.last_saved_scroll_pct).abs() < 0.04
-        {
-            return;
-        }
-        r.scroll_save_scheduled = true;
-        let book_rel = r.book_rel.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(600))
-                .await;
-            let _ = this.update(cx, |app, cx| {
-                let cur_now = app.reader_current_scroll_pct();
-                let should_save = if let Some(r) = &mut app.reader {
-                    if r.book_rel == book_rel {
-                        r.scroll_save_scheduled = false;
-                        !r.show_toc
-                            && !r.show_notes
-                            && r.pending_scroll_block.is_none()
-                            && r.pending_scroll_fraction.is_none()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_save {
-                    app.persist_reader_progress(cur_now, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
     pub fn open_book(&mut self, rel_path: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open_book_with_notes(rel_path, false, window, cx);
     }
@@ -2068,7 +2229,10 @@ impl BookwormMobileApp {
                         show_chapter_header: false,
                     }],
                     adjacent_pages_cache: HashMap::new(),
-                    pages_cache_key: None,
+                    pages_layout_key: None,
+                    pages_chapter_idx: None,
+                    pending_prepag: None,
+                    prepag_scheduled: false,
                     current_page: 0,
                     pending_last_page: false,
                     needs_page_recompute: true,
@@ -2092,11 +2256,12 @@ impl BookwormMobileApp {
                     flip_anim: None,
                     flip_anim_gen: 0,
                     rendered_layouts: Rc::new(RefCell::new(Vec::new())),
+                    highlights_epoch: 0,
+                    slice_render_cache: RefCell::new(HashMap::new()),
                     decoded_images: RefCell::new(HashMap::new()),
                     pending_scroll_block: None,
                     pending_scroll_fraction,
                     last_saved_scroll_pct: restored_scroll,
-                    scroll_save_scheduled: false,
                 });
                 app.surface = AppSurface::Reader;
                 app.schedule_library_sync_save(false, cx);
@@ -2118,14 +2283,15 @@ impl BookwormMobileApp {
             r.current_page = 0;
             r.pending_last_page = false;
             r.needs_page_recompute = true;
-            r.pages_cache_key = None;
-            r.adjacent_pages_cache.clear();
+            r.prepag_scheduled = false;
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = None;
             self.persist_reader_progress(0.0, cx);
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
+            if gpui_mobile::keyboard_height() > 0.0 {
+                window.blur(cx);
+                gpui_mobile::hide_keyboard();
+            }
         }
         cx.notify();
     }
@@ -2152,13 +2318,16 @@ impl BookwormMobileApp {
             r.show_toc = false;
             r.show_notes = false;
             r.draft = None;
+            r.prepag_scheduled = false;
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = Some((hl.start_block, hl.start_offset));
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
             self.persist_reader_progress(frac, cx);
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
+            if gpui_mobile::keyboard_height() > 0.0 {
+                window.blur(cx);
+                gpui_mobile::hide_keyboard();
+            }
         }
         cx.notify();
     }
@@ -2179,13 +2348,16 @@ impl BookwormMobileApp {
             r.show_toc = false;
             r.show_notes = false;
             r.draft = None;
+            r.prepag_scheduled = false;
             r.rendered_layouts.borrow_mut().clear();
             r.pending_scroll_block = None;
             r.pending_scroll_fraction = Some(frac);
             r.needs_page_recompute = true;
             self.persist_reader_progress(frac, cx);
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
+            if gpui_mobile::keyboard_height() > 0.0 {
+                window.blur(cx);
+                gpui_mobile::hide_keyboard();
+            }
         }
         cx.notify();
     }
@@ -2321,6 +2493,8 @@ impl BookwormMobileApp {
                     updated_at: now,
                 },
             );
+            r.highlights_epoch = r.highlights_epoch.wrapping_add(1);
+            r.slice_render_cache.borrow_mut().clear();
             self.schedule_library_sync_save(true, cx);
         }
         window.blur(cx);
@@ -2336,6 +2510,8 @@ impl BookwormMobileApp {
                 && let Some(id) = d.existing_id
             {
                 self.library_store.delete_highlight(&r.book_rel, &id);
+                r.highlights_epoch = r.highlights_epoch.wrapping_add(1);
+                r.slice_render_cache.borrow_mut().clear();
                 self.schedule_library_sync_save(true, cx);
             }
         }
@@ -2368,6 +2544,9 @@ impl BookwormMobileApp {
             ReaderTheme::Sepia => ReaderThemePref::Sepia,
             ReaderTheme::Paper => ReaderThemePref::Paper,
         };
+        if let Some(r) = &mut self.reader {
+            r.slice_render_cache.borrow_mut().clear();
+        }
         self.schedule_library_sync_save(false, cx);
         cx.notify();
     }
