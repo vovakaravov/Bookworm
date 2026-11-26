@@ -98,20 +98,34 @@ def extract_ru_stressed(obj: dict) -> str:
     return ""
 
 
+def is_boilerplate_gloss(g: str) -> bool:
+    t = g.strip()
+    return (
+        not t
+        or "__NOTITLECONVERT__" in t
+        or "__NOEDITSECTION__" in t
+        or t.startswith("关于「")
+        or "请见「" in t
+        or "For pronunciation and definitions" in t
+        or "пока не переведено" in t
+        or "Это слово или выражение" in t
+    )
+
+
 def extract_glosses(obj: dict, convert_simplified: bool = False) -> list[str]:
-    out: list[str] = []
+    real_out: list[str] = []
     seen: set[str] = set()
     for sense in obj.get("senses") or []:
-        if len(out) >= 4:
+        if len(real_out) >= 4:
             break
         tags = set(sense.get("tags") or [])
-        if "no-gloss" in tags:
+        if "no-gloss" in tags or "form-of" in tags or sense.get("form_of"):
             continue
         raw_glosses = sense.get("glosses") or []
         if not raw_glosses:
             continue
         g = " — ".join(str(x).strip() for x in raw_glosses if str(x).strip())
-        if not g:
+        if is_boilerplate_gloss(g):
             continue
         if convert_simplified:
             g = to_simplified(g)
@@ -120,7 +134,31 @@ def extract_glosses(obj: dict, convert_simplified: bool = False) -> list[str]:
         low = g.lower()
         if low not in seen:
             seen.add(low)
-            out.append(g)
+            real_out.append(g)
+    return real_out
+
+
+def extract_form_of_targets(obj: dict, lang: str, self_key: str) -> list[tuple[str, str]]:
+    """Extracts `(target_lemma_key, gram)` links for pure form-of entries."""
+    out: list[tuple[str, str]] = []
+    seen_targets: set[str] = set()
+    for sense in obj.get("senses") or []:
+        form_of = sense.get("form_of") or []
+        if not form_of:
+            continue
+        raw_tags = [str(t).strip() for t in (sense.get("tags") or []) if str(t).strip() not in ("", "form-of", "no-gloss")]
+        gram = ", ".join(raw_tags[:3])
+        for fo in form_of:
+            tw_raw = str((fo or {}).get("word") or "").strip()
+            if not tw_raw:
+                continue
+            tw = norm_key(tw_raw, lang)
+            if lang == "zh":
+                tw = norm_key(to_simplified(tw), "zh")
+            if not tw or tw == self_key or tw in seen_targets:
+                continue
+            seen_targets.add(tw)
+            out.append((tw, gram))
     return out
 
 
@@ -188,12 +226,18 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             gram TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (lang, form, lemma_id)
         ) WITHOUT ROWID;
+        CREATE TEMP TABLE form_links (
+            form TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            target_word TEXT NOT NULL,
+            gram TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     return conn
 
 
-def flush_batches(cur: sqlite3.Cursor, lemma_rows: list, form_rows: list) -> None:
+def flush_batches(cur: sqlite3.Cursor, lemma_rows: list, form_rows: list, form_link_rows: list) -> None:
     if lemma_rows:
         cur.executemany(
             "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -206,6 +250,12 @@ def flush_batches(cur: sqlite3.Cursor, lemma_rows: list, form_rows: list) -> Non
             form_rows,
         )
         form_rows.clear()
+    if form_link_rows:
+        cur.executemany(
+            "INSERT INTO form_links (form, lang, target_word, gram) VALUES (?, ?, ?, ?)",
+            form_link_rows,
+        )
+        form_link_rows.clear()
 
 
 def ingest_dump(
@@ -217,6 +267,7 @@ def ingest_dump(
     cur = conn.cursor()
     lemma_rows = []
     form_rows = []
+    form_link_rows = []
     next_id_row = cur.execute("SELECT COALESCE(MAX(id), 0) FROM lemmas").fetchone()
     lemma_id = int(next_id_row[0])
 
@@ -241,15 +292,21 @@ def ingest_dump(
             if not is_clean_headword(word, lang):
                 continue
 
-            glosses = extract_glosses(obj, convert_simplified=convert_zh_glosses)
-            if not glosses:
-                continue
-
             orig_key = norm_key(word, lang)
             if not orig_key:
                 continue
             key = norm_key(to_simplified(orig_key), "zh") if lang == "zh" else orig_key
             if not key:
+                continue
+
+            glosses = extract_glosses(obj, convert_simplified=convert_zh_glosses)
+            if not glosses:
+                for target_word, gram in extract_form_of_targets(obj, lang, key):
+                    form_link_rows.append((key, lang, target_word, gram))
+                    if lang == "zh" and orig_key != key:
+                        form_link_rows.append((orig_key, lang, target_word, gram))
+                if len(form_link_rows) >= 50_000:
+                    flush_batches(cur, lemma_rows, form_rows, form_link_rows)
                 continue
 
             lemma_id += 1
@@ -303,10 +360,10 @@ def ingest_dump(
                 total_forms += 1
 
             if len(lemma_rows) >= 25_000:
-                flush_batches(cur, lemma_rows, form_rows)
+                flush_batches(cur, lemma_rows, form_rows, form_link_rows)
                 seen_forms.clear()
 
-    flush_batches(cur, lemma_rows, form_rows)
+    flush_batches(cur, lemma_rows, form_rows, form_link_rows)
     conn.commit()
     return total_lemmas, total_forms
 
@@ -314,6 +371,16 @@ def ingest_dump(
 def finalize_and_compress(conn: sqlite3.Connection, db_path: Path, gz_path: Path) -> None:
     print(f"Creating index for {db_path.name}...")
     conn.execute("CREATE INDEX idx_lemmas_lang_word ON lemmas(lang, word);")
+    print(f"Resolving deferred form-of links for {db_path.name}...")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO forms (form, lang, lemma_id, gram)
+        SELECT fl.form, fl.lang, l.id, fl.gram
+        FROM form_links fl
+        JOIN lemmas l ON l.lang = fl.lang AND l.word = fl.target_word;
+        """
+    )
+    conn.execute("DROP TABLE IF EXISTS form_links;")
     conn.execute("ANALYZE;")
     conn.commit()
     conn.close()

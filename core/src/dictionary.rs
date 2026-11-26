@@ -574,29 +574,18 @@ impl DictionaryStore {
         }
 
         if let Some(conn) = self.offline_conns.get(&def_lang) {
-            let mut found = query_lemmas_exact(conn, def_lang, word_lang, &norm, None, None);
-            if found.is_empty() {
-                found = query_forms_joined(conn, def_lang, word_lang, &norm, &clean);
-            }
-            if found.is_empty() {
-                for cand in morphological_candidates(&norm, word_lang) {
-                    let hits = query_lemmas_exact(
-                        conn,
-                        def_lang,
-                        word_lang,
-                        &cand,
-                        Some(clean.clone()),
-                        Some("stem match".to_string()),
-                    );
-                    if !hits.is_empty() {
-                        found = hits;
-                        break;
-                    }
-                }
-            }
-            if !found.is_empty() {
-                self.insert_lru(cache_key, found.clone());
-                return Some(found);
+            let mut exact_entries = query_lemmas_exact(conn, def_lang, word_lang, &norm, None, None);
+            sanitize_entries(&mut exact_entries);
+
+            let resolved = if !exact_entries.is_empty() && !exact_entries.iter().any(is_stub_entry) {
+                exact_entries
+            } else {
+                resolve_offline_entries(conn, def_lang, word_lang, &norm, &clean, exact_entries)
+            };
+
+            if !resolved.is_empty() {
+                self.insert_lru(cache_key, resolved.clone());
+                return Some(resolved);
             }
         }
 
@@ -608,6 +597,7 @@ impl DictionaryStore {
                 e.def_lang = def_lang;
                 e.source = LookupSource::CachedOnline;
             }
+            sanitize_entries(&mut cached);
             if !cached.is_empty() {
                 self.insert_lru(cache_key, cached.clone());
                 return Some(cached);
@@ -684,6 +674,683 @@ fn row_to_entry(
     })
 }
 
+fn truncate_chars_trim(s: &str, max_chars: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    let prefix: String = t.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", prefix.trim_end())
+}
+
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    debug_assert!(needle_lower.is_ascii());
+    let nb = needle_lower.as_bytes();
+    let hb = haystack.as_bytes();
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    hb.windows(nb.len())
+        .position(|w| w.iter().zip(nb).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
+fn find_zh_stub_marker_pos(text: &str) -> Option<(usize, &'static str)> {
+    const ZH_STUB_MARKERS: &[&str] = &[
+        "的屈折",
+        "的复数",
+        "的单数",
+        "的阳性",
+        "的阴性",
+        "的中性",
+        "的主格",
+        "的属格",
+        "的与格",
+        "的宾格",
+        "的工具格",
+        "的前置格",
+        "的过去式",
+        "的过去分词",
+        "的现在分词",
+        "的现在时",
+        "的过去时",
+        "的将来时",
+        "的第三人称",
+        "的第一人称",
+        "的第二人称",
+        "的比较级",
+        "的最高级",
+        "的命令式",
+        "的变位",
+        "的变形",
+        "的简体",
+        "的简化字",
+        "的繁体",
+        "的异体字",
+        "的缩写",
+    ];
+    let mut best: Option<(usize, &'static str)> = None;
+    for &m in ZH_STUB_MARKERS {
+        if let Some(ix) = text.find(m)
+            && best.is_none_or(|(bix, _)| ix < bix)
+        {
+            best = Some((ix, m));
+        }
+    }
+    let (ix, marker) = best?;
+    let prefix = text[..ix].trim();
+    if prefix.is_empty()
+        || prefix
+            .chars()
+            .any(|c| matches!(c, '、' | '；' | '，' | '﹝' | '[' | '。'))
+    {
+        return None;
+    }
+    Some((ix, marker))
+}
+
+/// Returns `true` for MediaWiki boilerplate / redirect notices that are not definitions.
+pub fn is_boilerplate_gloss(gloss: &str) -> bool {
+    let t = gloss.trim();
+    t.is_empty()
+        || t.contains("__NOTITLECONVERT__")
+        || t.contains("__NOEDITSECTION__")
+        || t.starts_with("关于「")
+        || t.contains("请见「")
+        || t.contains("For pronunciation and definitions")
+        || t.contains("пока не переведено")
+        || t.contains("Это слово или выражение")
+}
+
+/// Returns `true` if `gloss` is MediaWiki boilerplate or a form-of/inflection/spelling stub.
+pub fn is_form_of_stub_gloss(gloss: &str) -> bool {
+    if is_boilerplate_gloss(gloss) {
+        return true;
+    }
+    let t = gloss.trim();
+    if find_zh_stub_marker_pos(t).is_some() {
+        return true;
+    }
+
+    let lower = t.to_lowercase();
+    const EN_STUB_PREFIXES: &[&str] = &[
+        "inflection of ",
+        "plural of ",
+        "singular of ",
+        "genitive of ",
+        "dative of ",
+        "accusative of ",
+        "instrumental of ",
+        "prepositional of ",
+        "locative of ",
+        "vocative of ",
+        "nominative of ",
+        "simple past of ",
+        "simple past and ",
+        "past participle of ",
+        "present participle ",
+        "comparative of ",
+        "comparative degree of ",
+        "comparative form of ",
+        "superlative of ",
+        "superlative degree of ",
+        "superlative form of ",
+        "diminutive of ",
+        "augmentative of ",
+        "feminine of ",
+        "masculine of ",
+        "neuter of ",
+        "alternative form of ",
+        "alternative spelling of ",
+        "obsolete form of ",
+        "obsolete spelling of ",
+        "archaic form of ",
+        "archaic spelling of ",
+        "dated form of ",
+        "dated spelling of ",
+        "pre-1918 spelling of ",
+        "superseded spelling of ",
+        "former spelling of ",
+        "pronunciation spelling of ",
+        "nonstandard form of ",
+        "colloquial form of ",
+        "dialectal form of ",
+        "misspelling of ",
+        "eye dialect of ",
+        "clipping of ",
+        "contraction of ",
+        "apocopic form of ",
+        "simplified form of ",
+        "traditional form of ",
+        "initialism of ",
+        "acronym of ",
+        "abbreviation of ",
+    ];
+    if EN_STUB_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+
+    if let Some(of_ix) = find_ascii_ci(&lower, " of ") {
+        let prefix = lower[..of_ix].trim();
+        let article_prefix = ["a ", "an ", "the ", "to ", "one ", "someone ", "something ", "any "]
+            .iter()
+            .any(|p| prefix.starts_with(p));
+        const EN_GRAM_MARKERS: &[&str] = &[
+            "masculine",
+            "feminine",
+            "neuter",
+            "singular",
+            "plural",
+            "genitive",
+            "dative",
+            "accusative",
+            "instrumental",
+            "prepositional",
+            "locative",
+            "vocative",
+            "nominative",
+            "indicative",
+            "imperative",
+            "subjunctive",
+            "conditional",
+            "participle",
+            "gerund",
+            "infinitive",
+            "imperfective",
+            "perfective",
+            "first-person",
+            "second-person",
+            "third-person",
+            "past",
+            "future",
+            "comparative",
+            "superlative",
+            "inflection",
+            "spelling",
+            "diminutive",
+            "augmentative",
+            "short-form",
+            "initialism",
+            "acronym",
+            "abbreviation",
+        ];
+        if !prefix.is_empty()
+            && prefix.len() <= 100
+            && !article_prefix
+            && EN_GRAM_MARKERS.iter().any(|m| prefix.contains(m))
+        {
+            return true;
+        }
+    }
+
+    const RU_STUB_PREFIXES: &[&str] = &[
+        "форма ",
+        "формы ",
+        "неёфицированная форма ",
+        "краткая форма ",
+        "кратк. ",
+        "мн. ч. от ",
+        "ед. ч. от ",
+        "прич. от ",
+        "причастие ",
+        "дееприч. от ",
+        "деепричастие ",
+        "женск. к ",
+        "сравн. ст. к ",
+        "превосх. ст. к ",
+        "устар. написание ",
+        "см. ",
+    ];
+    if RU_STUB_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    if lower.contains(" форма ")
+        && [
+            "глагола ",
+            "существительного ",
+            "прилагательного ",
+            "местоимения ",
+            "числительного ",
+            "причастия ",
+            "падежа ",
+            "времени ",
+        ]
+        .iter()
+        .any(|m| lower.contains(m))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Returns `true` when `entry` carries no real gloss (empty or every gloss is a stub/boilerplate).
+pub fn is_stub_entry(entry: &DictionaryEntry) -> bool {
+    entry.glosses.is_empty() || entry.glosses.iter().all(|g| is_form_of_stub_gloss(g))
+}
+
+fn sanitize_entry_glosses(entry: &mut DictionaryEntry) {
+    entry.glosses.retain(|g| !is_boilerplate_gloss(g));
+    if entry.glosses.len() > 1 {
+        let mut real = Vec::with_capacity(entry.glosses.len());
+        let mut stubs = Vec::new();
+        for g in entry.glosses.drain(..) {
+            if is_form_of_stub_gloss(&g) {
+                stubs.push(g);
+            } else {
+                real.push(g);
+            }
+        }
+        if !real.is_empty() {
+            real.extend(stubs);
+            entry.glosses = real;
+        } else {
+            entry.glosses = stubs;
+        }
+    }
+}
+
+fn sanitize_entries(entries: &mut Vec<DictionaryEntry>) {
+    for e in entries.iter_mut() {
+        sanitize_entry_glosses(e);
+    }
+    entries.retain(|e| !e.glosses.is_empty());
+}
+
+fn clean_extracted_target(raw: &str, word_lang: &str) -> Option<String> {
+    let mut s = raw.trim();
+    let lower = s.to_ascii_lowercase();
+    for lead in [
+        "the verb ",
+        "verb ",
+        "the noun ",
+        "noun ",
+        "the adjective ",
+        "adjective ",
+    ] {
+        if lower.starts_with(lead) {
+            s = s[lead.len()..].trim();
+            break;
+        }
+    }
+    let before_punct = s
+        .split(['(', '（', ':', ';', ',', '—', '–', '.', '\n'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let before_conj = before_punct
+        .find(" and ")
+        .map(|i| &before_punct[..i])
+        .unwrap_or(before_punct);
+    let before_conj = before_conj
+        .find(" or ")
+        .map(|i| &before_conj[..i])
+        .unwrap_or(before_conj);
+    let cleaned = trim_lookup_punctuation(before_conj);
+    let cand = extract_lookup_word(cleaned)?;
+    (detect_lang(&cand) == word_lang).then_some(cand)
+}
+
+/// Extracts the base lemma referenced by a form-of stub gloss when `forms` lacks a direct link.
+pub fn extract_stub_target_lemma(gloss: &str, word_lang: &str) -> Option<String> {
+    let t = gloss.trim();
+    if t.is_empty() {
+        return None;
+    }
+
+    if let Some((ix, _)) = find_zh_stub_marker_pos(t) {
+        let prefix = t[..ix].trim();
+        let head = prefix.split(['(', '（']).next().unwrap_or("").trim();
+        let cleaned = trim_lookup_punctuation(head);
+        if let Some(cand) = extract_lookup_word(cleaned)
+            && detect_lang(&cand) == word_lang
+        {
+            return Some(cand);
+        }
+    }
+
+    if let Some(of_ix) = find_ascii_ci(t, " of ") {
+        let tail = &t[of_ix + 4..];
+        if let Some(cand) = clean_extracted_target(tail, word_lang) {
+            return Some(cand);
+        }
+    }
+
+    let lower = t.to_lowercase();
+    const RU_MARKERS: &[&str] = &[
+        " глагола ",
+        " существительного ",
+        " прилагательного ",
+        " местоимения ",
+        " числительного ",
+        " причастия ",
+        " к прил. ",
+        " к нареч. ",
+        " от ",
+        " к ",
+    ];
+    let mut best_end: Option<usize> = None;
+    for m in RU_MARKERS {
+        if let Some(ix) = lower.rfind(m) {
+            let end = ix + m.len();
+            if best_end.is_none_or(|b| end > b) {
+                best_end = Some(end);
+            }
+        }
+    }
+    if let Some(end) = best_end {
+        let tail = &lower[end..];
+        let first_seg = tail
+            .split(['(', '（', ':', ';', ',', '.', '—', '–', '\n'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        let first_word = first_seg.split_whitespace().next().unwrap_or("");
+        let cleaned = trim_lookup_punctuation(first_word);
+        if let Some(cand) = extract_lookup_word(cleaned)
+            && detect_lang(&cand) == word_lang
+        {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+/// Extracts a concise grammatical inflection summary from a form-of stub gloss.
+pub fn extract_gram_from_stub(gloss: &str) -> Option<String> {
+    let t = gloss.trim();
+    if t.is_empty() || is_boilerplate_gloss(t) {
+        return None;
+    }
+
+    if let Some((ix, _)) = find_zh_stub_marker_pos(t) {
+        // `t[ix..]` begins with `'的'` (3 UTF-8 bytes); strip it cleanly.
+        let after_de = t[ix..].strip_prefix('的').unwrap_or(&t[ix..]);
+        let clean = after_de
+            .replace("： — ", " · ")
+            .replace("：—", " · ")
+            .replace(" — ", " · ");
+        let clean = clean.trim().trim_end_matches([':', '：', '—']).trim();
+        if !clean.is_empty() {
+            return Some(truncate_chars_trim(clean, 72));
+        }
+    }
+
+    if find_ascii_ci(t, "inflection of ").is_some() {
+        if let Some(dash_ix) = t.find('—') {
+            let detail = t[dash_ix + '—'.len_utf8()..].trim();
+            if !detail.is_empty() {
+                return Some(truncate_chars_trim(detail, 72));
+            }
+        }
+        return Some("inflection".to_string());
+    }
+
+    if let Some(of_ix) = find_ascii_ci(t, " of ") {
+        let prefix = t[..of_ix].trim();
+        if !prefix.is_empty() {
+            return Some(truncate_chars_trim(prefix, 72));
+        }
+    }
+
+    let lower = t.to_lowercase();
+    for m in [
+        " глагола ",
+        " существительного ",
+        " прилагательного ",
+        " местоимения ",
+        " числительного ",
+        " причастия ",
+        " к прил. ",
+        " к нареч. ",
+        " от ",
+        " к ",
+    ] {
+        if let Some(ix) = lower.rfind(m) {
+            let prefix = lower[..ix].trim();
+            if !prefix.is_empty() {
+                return Some(truncate_chars_trim(prefix, 72));
+            }
+        }
+    }
+
+    Some(truncate_chars_trim(t, 72))
+}
+
+fn push_unique_entries(
+    dst: &mut Vec<DictionaryEntry>,
+    seen: &mut Vec<(String, String, String)>,
+    items: Vec<DictionaryEntry>,
+    word_lang: &str,
+) {
+    for entry in items {
+        let key = (
+            normalize_lookup_key(&entry.headword, word_lang),
+            entry.pos.clone(),
+            entry.glosses.first().cloned().unwrap_or_default(),
+        );
+        if !seen.contains(&key) {
+            seen.push(key);
+            dst.push(entry);
+        }
+    }
+}
+
+fn sort_hits_by_pos(hits: &mut Vec<DictionaryEntry>, preferred_pos: &str) {
+    if preferred_pos.is_empty() || hits.len() <= 1 {
+        return;
+    }
+    hits.sort_by_key(|e| i32::from(e.pos != preferred_pos));
+}
+
+fn lookup_real_lemma_offline(
+    conn: &Connection,
+    def_lang: DictDefLang,
+    word_lang: &str,
+    target_norm: &str,
+    raw_form: &str,
+    gram_tag: Option<String>,
+    preferred_pos: &str,
+    depth: u8,
+) -> Vec<DictionaryEntry> {
+    let mut raw_hits = query_lemmas_exact(
+        conn,
+        def_lang,
+        word_lang,
+        target_norm,
+        Some(raw_form.to_string()),
+        gram_tag.clone(),
+    );
+    sanitize_entries(&mut raw_hits);
+
+    let mut real_hits: Vec<DictionaryEntry> = raw_hits
+        .iter()
+        .filter(|e| !is_stub_entry(e))
+        .cloned()
+        .collect();
+    if !real_hits.is_empty() {
+        sort_hits_by_pos(&mut real_hits, preferred_pos);
+        return real_hits;
+    }
+
+    if depth > 0 {
+        for stub in raw_hits {
+            for g in &stub.glosses {
+                if let Some(next_lemma) = extract_stub_target_lemma(g, word_lang) {
+                    let next_norm = normalize_lookup_key(&next_lemma, word_lang);
+                    if !next_norm.is_empty() && next_norm != target_norm {
+                        let next_hits = lookup_real_lemma_offline(
+                            conn,
+                            def_lang,
+                            word_lang,
+                            &next_norm,
+                            raw_form,
+                            gram_tag.clone().or_else(|| extract_gram_from_stub(g)),
+                            preferred_pos,
+                            depth - 1,
+                        );
+                        if !next_hits.is_empty() {
+                            return next_hits;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+fn resolve_stub_offline(
+    conn: &Connection,
+    def_lang: DictDefLang,
+    word_lang: &str,
+    norm: &str,
+    raw_form: &str,
+    stub: &DictionaryEntry,
+) -> Vec<DictionaryEntry> {
+    let mut target_norms: Vec<(String, Option<String>)> = Vec::new();
+    for g in &stub.glosses {
+        if let Some(target) = extract_stub_target_lemma(g, word_lang) {
+            let tnorm = normalize_lookup_key(&target, word_lang);
+            if !tnorm.is_empty()
+                && tnorm != norm
+                && !target_norms.iter().any(|(existing, _)| existing == &tnorm)
+            {
+                target_norms.push((tnorm, extract_gram_from_stub(g)));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for (tnorm, gram) in target_norms {
+        let hits = lookup_real_lemma_offline(
+            conn,
+            def_lang,
+            word_lang,
+            &tnorm,
+            raw_form,
+            gram,
+            &stub.pos,
+            1,
+        );
+        push_unique_entries(&mut out, &mut seen, hits, word_lang);
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    let mut form_hits = query_forms_joined(conn, def_lang, word_lang, norm, raw_form);
+    sanitize_entries(&mut form_hits);
+    sort_hits_by_pos(&mut form_hits, &stub.pos);
+    for hit in form_hits {
+        if !is_stub_entry(&hit) {
+            push_unique_entries(&mut out, &mut seen, vec![hit], word_lang);
+        } else {
+            for g in &hit.glosses {
+                if let Some(target) = extract_stub_target_lemma(g, word_lang) {
+                    let tnorm = normalize_lookup_key(&target, word_lang);
+                    if !tnorm.is_empty() && tnorm != norm {
+                        let nested = lookup_real_lemma_offline(
+                            conn,
+                            def_lang,
+                            word_lang,
+                            &tnorm,
+                            raw_form,
+                            hit.gram_tag.clone().or_else(|| extract_gram_from_stub(g)),
+                            &stub.pos,
+                            1,
+                        );
+                        push_unique_entries(&mut out, &mut seen, nested, word_lang);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn resolve_offline_entries(
+    conn: &Connection,
+    def_lang: DictDefLang,
+    word_lang: &str,
+    norm: &str,
+    clean: &str,
+    exact_entries: Vec<DictionaryEntry>,
+) -> Vec<DictionaryEntry> {
+    let mut resolved = Vec::new();
+    let mut seen = Vec::new();
+    let mut fallback_stubs = Vec::new();
+
+    for entry in exact_entries {
+        if !is_stub_entry(&entry) {
+            push_unique_entries(&mut resolved, &mut seen, vec![entry], word_lang);
+        } else {
+            let sub = resolve_stub_offline(conn, def_lang, word_lang, norm, clean, &entry);
+            if !sub.is_empty() {
+                push_unique_entries(&mut resolved, &mut seen, sub, word_lang);
+            } else {
+                fallback_stubs.push(entry);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        let mut form_hits = query_forms_joined(conn, def_lang, word_lang, norm, clean);
+        sanitize_entries(&mut form_hits);
+        for hit in form_hits {
+            if !is_stub_entry(&hit) {
+                push_unique_entries(&mut resolved, &mut seen, vec![hit], word_lang);
+            } else {
+                for g in &hit.glosses {
+                    if let Some(target) = extract_stub_target_lemma(g, word_lang) {
+                        let tnorm = normalize_lookup_key(&target, word_lang);
+                        if !tnorm.is_empty() && tnorm != norm {
+                            let nested = lookup_real_lemma_offline(
+                                conn,
+                                def_lang,
+                                word_lang,
+                                &tnorm,
+                                clean,
+                                hit.gram_tag.clone().or_else(|| extract_gram_from_stub(g)),
+                                &hit.pos,
+                                1,
+                            );
+                            push_unique_entries(&mut resolved, &mut seen, nested, word_lang);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        for cand in morphological_candidates(norm, word_lang) {
+            let mut hits = query_lemmas_exact(
+                conn,
+                def_lang,
+                word_lang,
+                &cand,
+                Some(clean.to_string()),
+                Some("stem match".to_string()),
+            );
+            sanitize_entries(&mut hits);
+            hits.retain(|e| !is_stub_entry(e));
+            if !hits.is_empty() {
+                push_unique_entries(&mut resolved, &mut seen, hits, word_lang);
+                break;
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        push_unique_entries(&mut resolved, &mut seen, fallback_stubs, word_lang);
+    }
+
+    resolved
+}
+
 fn query_lemmas_exact(
     conn: &Connection,
     def_lang: DictDefLang,
@@ -696,7 +1363,7 @@ fn query_lemmas_exact(
         "SELECT lang, word, stressed, ipa, pos, glosses_json, ru_tr
          FROM lemmas
          WHERE lang = ?1 AND word = ?2
-         LIMIT 6",
+         LIMIT 12",
     ) else {
         return Vec::new();
     };
@@ -720,7 +1387,7 @@ fn query_forms_joined(
          FROM forms f
          JOIN lemmas l ON l.id = f.lemma_id
          WHERE f.lang = ?1 AND f.form = ?2
-         LIMIT 6",
+         LIMIT 12",
     ) else {
         return Vec::new();
     };
@@ -912,11 +1579,12 @@ fn fetch_wiktionary_rest_en(
                 continue;
             };
             let plain = strip_html_and_entities(html);
-            if plain.is_empty() {
+            if plain.is_empty() || is_boilerplate_gloss(&plain) {
                 continue;
             }
             if depth > 0
                 && let Some(target) = extract_wiktionary_form_target(html, &plain)
+                    .or_else(|| extract_stub_target_lemma(&plain, lang))
                 && !form_targets.contains(&target)
             {
                 form_targets.push(target);
@@ -940,13 +1608,19 @@ fn fetch_wiktionary_rest_en(
         }
     }
 
+    sanitize_entries(&mut out);
+
     if depth > 0
+        && (out.is_empty() || out.first().is_some_and(is_stub_entry))
         && let Some(lemma) = form_targets.into_iter().next()
         && normalize_lookup_key(&lemma, lang) != normalize_lookup_key(term, lang)
     {
         let mut lemma_entries = fetch_wiktionary_rest_en(agent, &lemma, lang, 0);
         if !lemma_entries.is_empty() {
-            let form_note = out.first().and_then(|e| e.glosses.first()).cloned();
+            let form_note = out
+                .first()
+                .and_then(|e| e.glosses.first())
+                .and_then(|g| extract_gram_from_stub(g));
             for le in &mut lemma_entries {
                 le.matched_form = Some(term.to_string());
                 if le.gram_tag.is_none() {
@@ -1116,16 +1790,12 @@ pub fn parse_mediawiki_definition_html(
             li_pos = (li_end + 5).min(ol_body.len());
 
             let plain = clean_mediawiki_item(raw_li);
-            if plain.is_empty()
-                || plain.contains("пока не переведено")
-                || plain.contains("Это слово или выражение")
-            {
+            if is_boilerplate_gloss(&plain) {
                 continue;
             }
-            if redirect_target.is_none()
-                && extract_wiktionary_form_target(raw_li, &plain).is_some()
-            {
-                redirect_target = extract_last_wiki_link_target(raw_li);
+            if redirect_target.is_none() {
+                redirect_target = extract_wiktionary_form_target(raw_li, &plain)
+                    .or_else(|| extract_stub_target_lemma(&plain, word_lang));
             }
             if !glosses.contains(&plain) {
                 glosses.push(plain);
@@ -1194,12 +1864,13 @@ fn fetch_mediawiki_wiktionary(
         return Vec::new();
     };
 
-    let (entries, redirect_target) =
+    let (mut entries, redirect_target) =
         parse_mediawiki_definition_html(html, term, word_lang, def_lang);
+    sanitize_entries(&mut entries);
     if depth > 0
         && let Some(target) = redirect_target
         && normalize_lookup_key(&target, word_lang) != normalize_lookup_key(term, word_lang)
-        && (entries.is_empty() || word_lang == "zh")
+        && (entries.is_empty() || entries.iter().all(is_stub_entry) || word_lang == "zh")
     {
         let mut target_entries = fetch_mediawiki_wiktionary(
             agent,
@@ -1210,11 +1881,16 @@ fn fetch_mediawiki_wiktionary(
             zh_cn_variant,
             0,
         );
+        sanitize_entries(&mut target_entries);
         if !target_entries.is_empty() {
+            let form_note = entries
+                .first()
+                .and_then(|e| e.glosses.first())
+                .and_then(|g| extract_gram_from_stub(g));
             for te in &mut target_entries {
                 te.matched_form = Some(term.to_string());
                 if te.gram_tag.is_none() {
-                    te.gram_tag = entries.first().and_then(|e| e.glosses.first()).cloned();
+                    te.gram_tag = form_note.clone();
                 }
             }
             return target_entries;
@@ -1391,7 +2067,8 @@ fn download_offline_pack_into(
 mod tests {
     use super::{
         DictDefLang, DictionaryEntry, DictionaryStore, LookupSource, detect_lang,
-        extract_lookup_word, morphological_candidates, normalize_lookup_key,
+        extract_gram_from_stub, extract_lookup_word, extract_stub_target_lemma,
+        is_form_of_stub_gloss, morphological_candidates, normalize_lookup_key,
         parse_mediawiki_definition_html, write_cached_entries,
     };
     use rusqlite::{Connection, params};
@@ -1583,5 +2260,265 @@ mod tests {
             parse_mediawiki_definition_html(zh_see_html, "阅读", "zh", DictDefLang::En);
         assert!(zh_entries.is_empty());
         assert_eq!(zh_redir.as_deref(), Some("閱讀"));
+    }
+
+    fn init_test_pack(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lemmas (
+                id INTEGER PRIMARY KEY,
+                lang TEXT NOT NULL,
+                word TEXT NOT NULL,
+                stressed TEXT NOT NULL DEFAULT '',
+                ipa TEXT NOT NULL DEFAULT '',
+                pos TEXT NOT NULL DEFAULT '',
+                glosses_json TEXT NOT NULL,
+                ru_tr TEXT
+            );
+            CREATE INDEX idx_lemmas_lang_word ON lemmas(lang, word);
+            CREATE TABLE forms (
+                form TEXT NOT NULL,
+                lang TEXT NOT NULL,
+                lemma_id INTEGER NOT NULL,
+                gram TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (lang, form, lemma_id)
+            ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn stub_classifier_does_not_false_positive_on_real_definitions() {
+        assert!(!is_form_of_stub_gloss("a person of great courage"));
+        assert!(!is_form_of_stub_gloss("a form of artistic expression"));
+        assert!(!is_form_of_stub_gloss("the act of running"));
+        assert!(!is_form_of_stub_gloss("a piece of paper"));
+        assert!(!is_form_of_stub_gloss("较好、更好、使某某变得更好﹝good的比较级﹞"));
+        assert!(!is_form_of_stub_gloss(
+            "носитель информации в виде сброшюрованных листов бумаги"
+        ));
+
+        assert!(is_form_of_stub_gloss(
+            "short masculine singular of трусли́вый (truslívyj)"
+        ));
+        assert!(is_form_of_stub_gloss(
+            "inflection of кни́га (kníga): — genitive singular"
+        ));
+        assert!(is_form_of_stub_gloss(
+            "ходи́ть (xodítʹ) 的阳性单数过去时直陈式非完整体"
+        ));
+        assert!(is_form_of_stub_gloss(
+            "форма прошедшего времени мужского рода глагола сказать"
+        ));
+        assert!(is_form_of_stub_gloss(
+            "__NOTITLECONVERT__\n 关于「书」的发音和释义，请见「书」。"
+        ));
+
+        assert_eq!(
+            extract_stub_target_lemma("short masculine singular of трусли́вый (truslívyj)", "ru")
+                .as_deref(),
+            Some("трусли́вый")
+        );
+        assert_eq!(
+            extract_gram_from_stub("short masculine singular of трусли́вый (truslívyj)").as_deref(),
+            Some("short masculine singular")
+        );
+        assert_eq!(
+            extract_stub_target_lemma("ходи́ть (xodítʹ) 的阳性单数过去时直陈式非完整体", "ru")
+                .as_deref(),
+            Some("ходи́ть")
+        );
+    }
+
+    #[test]
+    fn stub_resolution_resolves_ru_en_zh_inflections_and_strips_boilerplate() {
+        let dir = tempdir().unwrap();
+
+        // EN pack
+        {
+            let conn = init_test_pack(&dir.path().join(DictDefLang::En.pack_filename()));
+            let insert_lemma = |id: i64, lang: &str, word: &str, stressed: &str, pos: &str, glosses: &str| {
+                conn.execute(
+                    "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr)
+                     VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, NULL)",
+                    params![id, lang, word, stressed, pos, glosses],
+                )
+                .unwrap();
+            };
+            insert_lemma(
+                1,
+                "ru",
+                "труслив",
+                "трусли́в",
+                "adj",
+                r#"["short masculine singular of трусли́вый (truslívyj)"]"#,
+            );
+            insert_lemma(
+                2,
+                "ru",
+                "трусливый",
+                "трусли́вый",
+                "adj",
+                r#"["cowardly","faint-hearted, timid"]"#,
+            );
+            conn.execute(
+                "INSERT INTO forms (form, lang, lemma_id, gram) VALUES (?1, ?2, ?3, ?4)",
+                params!["труслив", "ru", 2i64, "masculine, short-form"],
+            )
+            .unwrap();
+
+            insert_lemma(
+                3,
+                "ru",
+                "книги",
+                "",
+                "noun",
+                r#"["inflection of кни́га (kníga): — genitive singular"]"#,
+            );
+            insert_lemma(4, "ru", "книга", "кни́га", "noun", r#"["book"]"#);
+
+            insert_lemma(
+                5,
+                "ru",
+                "пошел",
+                "",
+                "verb",
+                r#"["masculine singular past indicative perfective of пойти́ (pojtí)"]"#,
+            );
+            insert_lemma(
+                6,
+                "ru",
+                "пошел",
+                "",
+                "intj",
+                r#"["begone!, go away! (to a man)"]"#,
+            );
+            insert_lemma(7, "ru", "пойти", "пойти́", "verb", r#"["to go","to walk"]"#);
+
+            insert_lemma(8, "en", "went", "", "verb", r#"["simple past of go"]"#);
+            insert_lemma(9, "en", "went", "", "noun", r#"["A course; a way"]"#);
+            insert_lemma(10, "en", "go", "", "verb", r#"["To move through space"]"#);
+
+            insert_lemma(11, "en", "dogs", "", "noun", r#"["plural of dog"]"#);
+            insert_lemma(12, "en", "dogs", "", "noun", r#"["Feet, from rhyming slang dog's meat."]"#);
+            insert_lemma(
+                13,
+                "en",
+                "dog",
+                "",
+                "noun",
+                r#"["Initialism of digital on-screen graphic."]"#,
+            );
+            insert_lemma(
+                14,
+                "en",
+                "dog",
+                "",
+                "noun",
+                r#"["A mammal of the family Canidae"]"#,
+            );
+        }
+
+        // RU pack
+        {
+            let conn = init_test_pack(&dir.path().join(DictDefLang::Ru.pack_filename()));
+            let insert_lemma = |id: i64, lang: &str, word: &str, pos: &str, glosses: &str| {
+                conn.execute(
+                    "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr)
+                     VALUES (?1, ?2, ?3, '', '', ?4, ?5, NULL)",
+                    params![id, lang, word, pos, glosses],
+                )
+                .unwrap();
+            };
+            insert_lemma(
+                1,
+                "ru",
+                "сказал",
+                "verb",
+                r#"["форма прошедшего времени мужского рода первого, второго и третьего лица единственного числа изъявительного наклонения глагола сказать"]"#,
+            );
+            insert_lemma(2, "ru", "сказать", "verb", r#"["выразить словесно"]"#);
+            insert_lemma(3, "ru", "думая", "verb", r#"["дееприч. от думать"]"#);
+            insert_lemma(4, "ru", "думать", "verb", r#"["осуществлять мыслительную деятельность"]"#);
+            insert_lemma(5, "ru", "прочитанный", "verb", r#"["прич. от прочитать"]"#);
+            insert_lemma(6, "ru", "прочитать", "verb", r#"["провести некоторое время, читая"]"#);
+        }
+
+        // ZH pack
+        {
+            let conn = init_test_pack(&dir.path().join(DictDefLang::ZhHans.pack_filename()));
+            let insert_lemma = |id: i64, lang: &str, word: &str, pos: &str, glosses: &str| {
+                conn.execute(
+                    "INSERT INTO lemmas (id, lang, word, stressed, ipa, pos, glosses_json, ru_tr)
+                     VALUES (?1, ?2, ?3, '', '', ?4, ?5, NULL)",
+                    params![id, lang, word, pos, glosses],
+                )
+                .unwrap();
+            };
+            insert_lemma(
+                1,
+                "ru",
+                "ходил",
+                "verb",
+                r#"["ходи́ть (xodítʹ) 的阳性单数过去时直陈式非完整体"]"#,
+            );
+            insert_lemma(2, "ru", "ходить", "verb", r#"["走，行走"]"#);
+            insert_lemma(
+                3,
+                "zh",
+                "书",
+                "unknown",
+                r#"["__NOTITLECONVERT__\n 关于「书」的发音和释义，请见「书」。"]"#,
+            );
+            insert_lemma(
+                4,
+                "zh",
+                "书",
+                "unknown",
+                r#"["书写，记录，记载。","图书，书籍。"]"#,
+            );
+        }
+
+        let mut store = DictionaryStore::open(dir.path().to_path_buf());
+
+        let trus = store.lookup_offline("труслив", DictDefLang::En).unwrap();
+        assert_eq!(trus[0].display_headword(), "трусли́вый");
+        assert_eq!(trus[0].glosses[0], "cowardly");
+        assert_eq!(trus[0].matched_form.as_deref(), Some("труслив"));
+        assert_eq!(trus[0].gram_tag.as_deref(), Some("short masculine singular"));
+
+        let knigi = store.lookup_offline("книги", DictDefLang::En).unwrap();
+        assert_eq!(knigi[0].headword, "книга");
+        assert_eq!(knigi[0].glosses[0], "book");
+
+        let poshel = store.lookup_offline("пошел", DictDefLang::En).unwrap();
+        assert_eq!(poshel[0].headword, "пойти");
+        assert_eq!(poshel[0].glosses[0], "to go");
+
+        let went = store.lookup_offline("went", DictDefLang::En).unwrap();
+        assert_eq!(went[0].headword, "go");
+        assert_eq!(went[0].glosses[0], "To move through space");
+
+        let dogs = store.lookup_offline("dogs", DictDefLang::En).unwrap();
+        assert_eq!(dogs[0].headword, "dog");
+        assert_eq!(dogs[0].glosses[0], "A mammal of the family Canidae");
+
+        let skazal = store.lookup_offline("сказал", DictDefLang::Ru).unwrap();
+        assert_eq!(skazal[0].headword, "сказать");
+        assert_eq!(skazal[0].glosses[0], "выразить словесно");
+
+        let dumaya = store.lookup_offline("думая", DictDefLang::Ru).unwrap();
+        assert_eq!(dumaya[0].headword, "думать");
+
+        let prochit = store.lookup_offline("прочитанный", DictDefLang::Ru).unwrap();
+        assert_eq!(prochit[0].headword, "прочитать");
+
+        let hodil_zh = store.lookup_offline("ходил", DictDefLang::ZhHans).unwrap();
+        assert_eq!(hodil_zh[0].headword, "ходить");
+        assert_eq!(hodil_zh[0].glosses[0], "走，行走");
+
+        let shu_zh = store.lookup_offline("书", DictDefLang::ZhHans).unwrap();
+        assert_eq!(shu_zh[0].glosses[0], "书写，记录，记载。");
     }
 }
