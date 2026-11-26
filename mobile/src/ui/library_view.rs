@@ -11,6 +11,31 @@ fn lib_icon(name: IconName, sz: f32, color: u32) -> impl IntoElement {
     Icon::new(name).size(px(sz)).text_color(hex_color(color))
 }
 
+fn long_press_overlay(
+    on_trigger: impl Fn(Point<Pixels>, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_trigger = std::rc::Rc::new(on_trigger);
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_bounds, hitbox, window, _cx| {
+            let on_trigger = on_trigger.clone();
+            window.on_mouse_event(move |ev: &gpui::LongPressEvent, phase, window, cx| {
+                if phase == gpui::DispatchPhase::Bubble
+                    && ev.phase == gpui::TouchPhase::Started
+                    && !window.default_prevented()
+                    && hitbox.is_hovered(window)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    on_trigger(ev.position, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 fn lib_header_icon_btn(
     id: &'static str,
     icon: IconName,
@@ -49,6 +74,8 @@ fn render_continue_reading_hero(
     cx: &mut Context<BookwormMobileApp>,
 ) -> impl IntoElement {
     let rel = book.rel_path.clone();
+    let rel_lp = book.rel_path.clone();
+    let app_weak_hero = cx.entity().downgrade();
     let title = book.display_title().to_string();
     let author = book.authors_display();
     let pct = book.progress_pct();
@@ -114,6 +141,7 @@ fn render_continue_reading_hero(
         .child(
             h_flex()
                 .id("lib-continue-hero")
+                .relative()
                 .w_full()
                 .p_3()
                 .gap_3()
@@ -125,6 +153,11 @@ fn render_continue_reading_hero(
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_book(&rel, window, cx);
+                }))
+                .child(long_press_overlay(move |_, window, cx| {
+                    let _ = app_weak_hero.update(cx, |this, cx| {
+                        this.open_book_context_menu(rel_lp.clone(), window, cx);
+                    });
                 }))
                 .child(thumb)
                 .child(
@@ -189,6 +222,8 @@ fn render_book_card(
     cx: &mut Context<BookwormMobileApp>,
 ) -> impl IntoElement {
     let rel = book.rel_path.clone();
+    let rel_lp = book.rel_path.clone();
+    let app_weak_card = cx.entity().downgrade();
     let title = book.display_title().to_string();
     let author = book.authors_display();
     let pct = book.progress_pct();
@@ -251,6 +286,7 @@ fn render_book_card(
 
     div()
         .id(SharedString::from(format!("book-card-{ix}")))
+        .relative()
         .flex_1()
         .min_w_0()
         .p_2p5()
@@ -264,6 +300,11 @@ fn render_book_card(
         .gap_2()
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_book(&rel, window, cx);
+        }))
+        .child(long_press_overlay(move |_, window, cx| {
+            let _ = app_weak_card.update(cx, |this, cx| {
+                this.open_book_context_menu(rel_lp.clone(), window, cx);
+            });
         }))
         .child(cover_el)
         .child(
@@ -718,6 +759,204 @@ pub fn render_library_tab(
                 )
                 .child(Scrollbar::vertical(&app.library_scroll)),
         )
+}
+
+fn book_menu_action_row(
+    id: &'static str,
+    icon: IconName,
+    label: String,
+    accent: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    h_flex()
+        .id(id)
+        .w_full()
+        .h(px(44.))
+        .px_3()
+        .gap_2p5()
+        .items_center()
+        .rounded(px(10.))
+        .bg(hex_color(if accent { kd::ACCENT } else { kd::BG_PANEL }))
+        .border_1()
+        .border_color(hex_color(if accent { kd::ACCENT } else { kd::BORDER_SUBTLE }))
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(lib_icon(
+            icon,
+            16.,
+            if accent { kd::BG_MAIN } else { kd::FG },
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hex_color(if accent { kd::BG_MAIN } else { kd::FG }))
+                .truncate()
+                .child(label),
+        )
+}
+
+pub fn render_book_context_menu(
+    app: &BookwormMobileApp,
+    cx: &mut Context<BookwormMobileApp>,
+) -> impl IntoElement {
+    let Some(rel_path) = app.book_context_menu.clone() else {
+        return div().into_any_element();
+    };
+    let Some(book) = app.books.iter().find(|b| b.rel_path == rel_path) else {
+        return div().into_any_element();
+    };
+
+    let title = book.display_title().to_string();
+    let author = book.authors_display();
+    let pct = book.progress_pct();
+    let hl_count = book.user.highlights.len() + book.user.bookmarks.len();
+    let current_status = book.user.status;
+
+    let rel_open = rel_path.clone();
+    let rel_hl = rel_path.clone();
+    let rel_exp = rel_path.clone();
+
+    v_flex()
+        .id("book-ctx-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(hex_alpha(0x0000009a))
+        .justify_end()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.close_book_context_menu(cx);
+        }))
+        .child(
+            v_flex()
+                .id("book-ctx-sheet")
+                .w_full()
+                .p_4()
+                .pb(px(16.0 + app.safe_area.bottom))
+                .gap_3()
+                .rounded_t(px(18.))
+                .bg(hex_color(kd::BG_SIDEBAR))
+                .border_t_1()
+                .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(hex_color(kd::FG))
+                                .truncate()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hex_color(kd::FG_SUBTLE))
+                                .truncate()
+                                .child(format!("{author} · {pct}% · ★{hl_count}")),
+                        ),
+                )
+                .child(book_menu_action_row(
+                    "bctx-open",
+                    IconName::BookOpen,
+                    if pct > 0 {
+                        "Resume Reading".to_string()
+                    } else {
+                        "Open Book".to_string()
+                    },
+                    true,
+                    cx.listener(move |this, _, window, cx| {
+                        this.book_context_menu = None;
+                        this.open_book(&rel_open, window, cx);
+                    }),
+                ))
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hex_color(kd::FG_MUTED))
+                                .child("READING STATUS"),
+                        )
+                        .child(
+                            h_flex().w_full().gap_1p5().children(
+                                ReadingStatus::all().iter().copied().map(|st| {
+                                    let active = current_status == st;
+                                    let rel_st = rel_path.clone();
+                                    div()
+                                        .id(SharedString::from(format!("bctx-st-{}", st.label())))
+                                        .flex_1()
+                                        .py_2()
+                                        .rounded(px(8.))
+                                        .cursor_pointer()
+                                        .bg(hex_color(if active {
+                                            kd::ACCENT
+                                        } else {
+                                            kd::BG_PANEL
+                                        }))
+                                        .border_1()
+                                        .border_color(hex_color(if active {
+                                            kd::ACCENT
+                                        } else {
+                                            kd::BORDER_SUBTLE
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hex_color(if active {
+                                            kd::BG_MAIN
+                                        } else {
+                                            kd::FG
+                                        }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.set_book_status(&rel_st, st, cx);
+                                        }))
+                                        .child(st.label())
+                                }),
+                            ),
+                        ),
+                )
+                .child(book_menu_action_row(
+                    "bctx-highlights",
+                    IconName::File,
+                    format!("View Highlights & Notes ({hl_count})"),
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_book_highlights(&rel_hl, window, cx);
+                    }),
+                ))
+                .child(book_menu_action_row(
+                    "bctx-export",
+                    IconName::Folder,
+                    "Export Notes to Markdown".to_string(),
+                    false,
+                    cx.listener(move |this, _, _, cx| {
+                        this.export_single_book_notes(&rel_exp, cx);
+                    }),
+                ))
+                .child(
+                    Button::new("bctx-cancel")
+                        .ghost()
+                        .small()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_book_context_menu(cx);
+                        })),
+                ),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

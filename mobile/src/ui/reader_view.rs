@@ -576,6 +576,14 @@ pub fn render_reader_view(
     let notes_color_filter = &r.notes_color_filter;
     let notes_only_filter = &r.notes_only_filter;
     let draft = &r.draft;
+    let draft_sheet_bounds_ref = r.draft_sheet_bounds.clone();
+    let settings_strip_bounds_ref = r.settings_strip_bounds.clone();
+    if !*show_settings {
+        *settings_strip_bounds_ref.borrow_mut() = None;
+    }
+    if draft.is_none() {
+        *draft_sheet_bounds_ref.borrow_mut() = None;
+    }
     let rendered_layouts = &r.rendered_layouts;
     let decoded_images = &r.decoded_images;
     let vp_slot = r.viewport_bounds.clone();
@@ -728,7 +736,9 @@ pub fn render_reader_view(
                 ),
         );
 
+    let settings_bounds_tracker = settings_strip_bounds_ref.clone();
     let settings_strip = v_flex()
+        .id("rdr-settings-overlay")
         .w_full()
         .px_3p5()
         .py_2p5()
@@ -736,6 +746,22 @@ pub fn render_reader_view(
         .bg(hex_color(pal.surface))
         .border_b_1()
         .border_color(hex_color(pal.border))
+        .shadow_md()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(
+            canvas(
+                move |bounds, _, _| {
+                    *settings_bounds_tracker.borrow_mut() = Some(bounds);
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .child(
             h_flex()
                 .justify_between()
@@ -1369,6 +1395,17 @@ pub fn render_reader_view(
                             return;
                         }
                         let _ = weak_td.update(cx, |app, cx| {
+                            let in_overlay = app.reader.as_ref().is_some_and(|r| {
+                                r.draft_sheet_bounds
+                                    .borrow()
+                                    .is_some_and(|b| b.contains(&ev.position))
+                                    || r.settings_strip_bounds
+                                        .borrow()
+                                        .is_some_and(|b| b.contains(&ev.position))
+                            });
+                            if in_overlay {
+                                return;
+                            }
                             let is_reading = app
                                 .reader
                                 .as_ref()
@@ -1425,6 +1462,7 @@ pub fn render_reader_view(
                                     let touch_gen = r.page_touch_gen;
                                     let start_pos = ev.start_position;
                                     r.page_touch_start_x = f32::from(start_pos.x);
+                                    r.page_touch_cur_pos = start_pos;
                                     r.page_touch_last_x = f32::from(start_pos.x);
                                     r.page_touch_last_at = Some(Instant::now());
                                     r.page_touch_vel_x = 0.0;
@@ -1437,7 +1475,7 @@ pub fn render_reader_view(
                                     let lp_bounds = bounds;
                                     r._page_lp_task = Some(cx.spawn(async move |this, cx| {
                                         cx.background_executor()
-                                            .timer(Duration::from_millis(410))
+                                            .timer(Duration::from_millis(360))
                                             .await;
                                         let _ = this.update(cx, |app, cx| {
                                             let Some(r) = &mut app.reader else {
@@ -1449,7 +1487,8 @@ pub fn render_reader_view(
                                             {
                                                 return;
                                             }
-                                            if r.select_word_at_point(start_pos, Some(lp_bounds)) {
+                                            let lp_pos = r.page_touch_cur_pos;
+                                            if r.select_word_at_point(lp_pos, Some(lp_bounds)) {
                                                 r.page_touch_mode =
                                                     Some(PageTouchMode::LongPressSelecting);
                                                 r.is_long_press_selecting = true;
@@ -1486,9 +1525,18 @@ pub fn render_reader_view(
                                             }
                                         }
                                         Some(PageTouchMode::Pending) => {
+                                            r.page_touch_cur_pos = ev.position;
                                             let dx = f32::from(ev.position.x - ev.start_position.x);
                                             let dy = f32::from(ev.position.y - ev.start_position.y);
-                                            if dx.abs() >= 9.0 && dx.abs() >= dy.abs() * 0.55 {
+                                            if r.draft.is_some() || r.show_settings {
+                                                if dx * dx + dy * dy > 64.0 {
+                                                    r.page_touch_gen =
+                                                        r.page_touch_gen.wrapping_add(1);
+                                                    r._page_lp_task = None;
+                                                }
+                                            } else if dx.abs() >= 9.0
+                                                && dx.abs() >= dy.abs() * 0.55
+                                            {
                                                 r.page_touch_mode =
                                                     Some(PageTouchMode::HorizontalSwipe);
                                                 r.page_touch_gen = r.page_touch_gen.wrapping_add(1);
@@ -1621,7 +1669,7 @@ pub fn render_reader_view(
                                                 });
                                                 if !moved_far {
                                                     let hit_pos =
-                                                        r.hit_test_position(ev.position, Some(bounds));
+                                                        r.hit_test_strict(ev.position, Some(bounds));
                                                     let existing_hl = hit_pos.and_then(|pos| {
                                                         let u = app
                                                             .library_store
@@ -1810,7 +1858,7 @@ pub fn render_reader_view(
                                 return;
                             }
                             let b = r.viewport_bounds.get();
-                            let hit_pos = r.hit_test_position(ev.position, Some(b));
+                            let hit_pos = r.hit_test_strict(ev.position, Some(b));
                             let existing_hl = hit_pos.and_then(|pos| {
                                 let user = this.library_store.books.get(&r.book_rel)?;
                                 r.highlight_at_pos(&user.highlights, pos).cloned()
@@ -1923,6 +1971,17 @@ pub fn render_reader_view(
                             return;
                         }
                         let _ = weak_lp.update(cx, |app, cx| {
+                            let in_overlay = app.reader.as_ref().is_some_and(|r| {
+                                r.draft_sheet_bounds
+                                    .borrow()
+                                    .is_some_and(|b| b.contains(&ev.position))
+                                    || r.settings_strip_bounds
+                                        .borrow()
+                                        .is_some_and(|b| b.contains(&ev.position))
+                            });
+                            if in_overlay {
+                                return;
+                            }
                             let is_reading = app
                                 .reader
                                 .as_ref()
@@ -1987,6 +2046,17 @@ pub fn render_reader_view(
                             return;
                         }
                         let _ = weak_td.update(cx, |app, cx| {
+                            let in_overlay = app.reader.as_ref().is_some_and(|r| {
+                                r.draft_sheet_bounds
+                                    .borrow()
+                                    .is_some_and(|b| b.contains(&ev.position))
+                                    || r.settings_strip_bounds
+                                        .borrow()
+                                        .is_some_and(|b| b.contains(&ev.position))
+                            });
+                            if in_overlay {
+                                return;
+                            }
                             let last_c = app.library_store.reader_prefs.last_highlight_color;
                             let last_s = app.library_store.reader_prefs.last_highlight_style;
                             let Some(r) = &mut app.reader else {
@@ -2268,7 +2338,7 @@ pub fn render_reader_view(
                                     }
 
                                     let b = r.viewport_bounds.get();
-                                    let hit_pos = r.hit_test_position(ev.position, Some(b));
+                                    let hit_pos = r.hit_test_strict(ev.position, Some(b));
                                     let existing_hl = hit_pos.and_then(|pos| {
                                         let user = this.library_store.books.get(&r.book_rel)?;
                                         r.highlight_at_pos(&user.highlights, pos).cloned()
@@ -2318,23 +2388,46 @@ pub fn render_reader_view(
     } else {
         format!("Ch {} / {} · {}%", ch_idx + 1, total_ch, pct)
     };
-    let footer = v_flex()
-        .w_full()
-        .flex_shrink_0()
-        .bg(hex_color(pal.surface))
-        .border_t_1()
-        .border_color(hex_color(pal.border))
-        .when_some(draft.clone(), |sheet_col, d| {
-            let preview: String = d.quote.chars().take(90).collect();
-            let has_existing = d.existing_id.is_some();
-            sheet_col.child(
+    let kb_height = gpui_mobile::keyboard_height();
+    let draft_sheet_bottom = (48.0 + app.safe_area.bottom).max(kb_height);
+    let draft_bounds_tracker = draft_sheet_bounds_ref.clone();
+    let floating_draft_sheet = draft.clone().map(|d| {
+        let preview: String = d.quote.chars().take(90).collect();
+        let has_existing = d.existing_id.is_some();
+        div()
+            .id("rdr-draft-sheet-overlay")
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(draft_sheet_bottom))
+            .px_2()
+            .pb_1()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
                 v_flex()
+                    .relative()
                     .w_full()
                     .p_3()
                     .gap_2()
-                    .bg(hex_color(pal.quote_bg))
-                    .border_b_1()
+                    .rounded(px(14.))
+                    .bg(hex_color(pal.surface))
+                    .border_1()
                     .border_color(hex_color(pal.border))
+                    .shadow_lg()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                *draft_bounds_tracker.borrow_mut() = Some(bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -2393,7 +2486,7 @@ pub fn render_reader_view(
                                     .bg(hex_color(if active {
                                         pal.accent
                                     } else {
-                                        pal.surface
+                                        pal.quote_bg
                                     }))
                                     .flex()
                                     .items_center()
@@ -2477,7 +2570,14 @@ pub fn render_reader_view(
                             ),
                     ),
             )
-        })
+    });
+
+    let footer = v_flex()
+        .w_full()
+        .flex_shrink_0()
+        .bg(hex_color(pal.surface))
+        .border_t_1()
+        .border_color(hex_color(pal.border))
         .child(
             h_flex()
                 .w_full()
@@ -2512,14 +2612,30 @@ pub fn render_reader_view(
         )
         .child(div().w_full().h(px(app.safe_area.bottom)));
 
-    v_flex()
+    div()
+        .relative()
         .size_full()
         .bg(hex_color(pal.bg))
         .text_color(hex_color(pal.fg))
-        .child(top_bar)
-        .when(*show_settings, |col| col.child(settings_strip))
-        .child(main_area)
-        .child(footer)
+        .child(
+            v_flex()
+                .size_full()
+                .child(top_bar)
+                .child(main_area)
+                .child(footer),
+        )
+        .when(*show_settings, |root| {
+            root.child(
+                div()
+                    .id("rdr-settings-backdrop")
+                    .absolute()
+                    .top(px(48.))
+                    .left_0()
+                    .right_0()
+                    .child(settings_strip),
+            )
+        })
+        .when_some(floating_draft_sheet, |root, sheet| root.child(sheet))
         .into_any_element()
 }
 

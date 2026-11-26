@@ -155,6 +155,8 @@ pub struct ReaderState {
     pub notes_color_filter: Option<HighlightColor>,
     pub notes_only_filter: bool,
     pub draft: Option<HighlightEditorDraft>,
+    pub draft_sheet_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    pub settings_strip_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     pub viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub chapter_pages: Vec<ChapterPage>,
     pub adjacent_pages_cache: HashMap<usize, Vec<ChapterPage>>,
@@ -171,6 +173,7 @@ pub struct ReaderState {
     pub page_touch_mode: Option<PageTouchMode>,
     pub page_touch_gen: u64,
     pub page_touch_start_x: f32,
+    pub page_touch_cur_pos: Point<Pixels>,
     pub page_touch_last_x: f32,
     pub page_touch_last_at: Option<Instant>,
     pub page_touch_vel_x: f32,
@@ -342,6 +345,47 @@ impl ReaderState {
         })
     }
 
+    pub fn hit_test_strict(
+        &self,
+        pos: Point<Pixels>,
+        clip_bounds: Option<Bounds<Pixels>>,
+    ) -> Option<TextPos> {
+        let layouts = self.rendered_layouts.borrow();
+        if layouts.is_empty() {
+            return None;
+        }
+        let in_clip = |b: Bounds<Pixels>| {
+            clip_bounds.is_none_or(|c| {
+                b.bottom() >= c.top() - px(12.) && b.top() <= c.bottom() + px(12.)
+            })
+        };
+
+        for (blk_ix, byte_base, slice_len, layout) in layouts.iter() {
+            let b = layout.bounds();
+            if !in_clip(b) {
+                continue;
+            }
+            if b.top() - px(4.) <= pos.y
+                && pos.y <= b.bottom() + px(4.)
+                && b.left() - px(6.) <= pos.x
+                && pos.x <= b.right() + px(6.)
+                && let Ok(rel_ix) = layout.index_for_position(pos)
+            {
+                let capped = rel_ix.min(*slice_len);
+                let safe_ix = if let Some(txt) = self.plain_text(*blk_ix) {
+                    clamp_to_char_boundary(txt, byte_base.saturating_add(capped))
+                } else {
+                    0
+                };
+                return Some(TextPos {
+                    block_idx: *blk_ix,
+                    byte_offset: safe_ix,
+                });
+            }
+        }
+        None
+    }
+
     pub fn highlight_at_pos<'a>(
         &self,
         highlights: &'a [BookHighlight],
@@ -399,7 +443,7 @@ impl ReaderState {
         pos: Point<Pixels>,
         clip_bounds: Option<Bounds<Pixels>>,
     ) -> bool {
-        let Some(hit) = self.hit_test_position(pos, clip_bounds) else {
+        let Some(hit) = self.hit_test_strict(pos, clip_bounds) else {
             return false;
         };
         let Some(txt) = self.plain_text(hit.block_idx) else {
@@ -528,6 +572,7 @@ pub struct BookwormMobileApp {
     pub reader: Option<ReaderState>,
     pub last_opened_rel: Option<String>,
     pub folder_picker: Option<FolderPickerState>,
+    pub book_context_menu: Option<String>,
 
     pub reader_theme: ReaderTheme,
     pub reader_font_size: f32,
@@ -864,6 +909,7 @@ impl BookwormMobileApp {
             reader: None,
             last_opened_rel: None,
             folder_picker: None,
+            book_context_menu: None,
             reader_theme,
             reader_font_size,
             reader_width,
@@ -1061,6 +1107,85 @@ impl BookwormMobileApp {
                 self.status_banner = Some(format!("Export failed: {err}"));
             }
         }
+        cx.notify();
+    }
+
+    pub fn open_book_context_menu(
+        &mut self,
+        rel_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.blur(cx);
+        gpui_mobile::hide_keyboard();
+        self.book_context_menu = Some(rel_path);
+        cx.notify();
+    }
+
+    pub fn close_book_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.book_context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_book_status(
+        &mut self,
+        rel_path: &str,
+        status: ReadingStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self
+            .library_store
+            .books
+            .entry(rel_path.to_string())
+            .or_default();
+        entry.status = status;
+        entry.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        let updated = entry.clone();
+        if let Some(book_rec) = self.books.iter_mut().find(|b| b.rel_path == rel_path) {
+            book_rec.user = updated;
+        }
+        let _ = self.library_store.sync_save(&self.library_state_root);
+        self.status_banner = Some(format!("Status set to {}", status.label()));
+        cx.notify();
+    }
+
+    pub fn open_book_highlights(
+        &mut self,
+        rel_path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.book_context_menu = None;
+        self.open_book(rel_path, window, cx);
+        if let Some(r) = &mut self.reader {
+            r.show_notes = true;
+            r.show_toc = false;
+            r.show_settings = false;
+        }
+        cx.notify();
+    }
+
+    pub fn export_single_book_notes(&mut self, rel_path: &str, cx: &mut Context<Self>) {
+        let Some(book) = self.books.iter().find(|b| b.rel_path == rel_path).cloned() else {
+            return;
+        };
+        let out_dir = self.books_root.join("Bookworm Notes");
+        match export_library_notes_to_dir(std::slice::from_ref(&book), &out_dir) {
+            Ok(0) => {
+                self.status_banner = Some("No highlights or bookmarks to export for this book.".to_string());
+            }
+            Ok(n) => {
+                self.status_banner = Some(format!(
+                    "Exported {n} Markdown file to {}",
+                    out_dir.display()
+                ));
+            }
+            Err(err) => {
+                self.status_banner = Some(format!("Export failed: {err}"));
+            }
+        }
+        self.book_context_menu = None;
         cx.notify();
     }
 
@@ -1293,6 +1418,10 @@ impl BookwormMobileApp {
             self.close_folder_picker(window, cx);
             return;
         }
+        if self.book_context_menu.is_some() {
+            self.close_book_context_menu(cx);
+            return;
+        }
 
         match self.surface {
             AppSurface::Reader => {
@@ -1411,6 +1540,14 @@ impl BookwormMobileApp {
         let Some(r) = &mut self.reader else {
             return;
         };
+        if r.pages_cache_key.is_some()
+            && (r.draft.is_some()
+                || r.is_long_press_selecting
+                || r.dragging_handle.is_some()
+                || r.page_touch_mode.is_some())
+        {
+            return;
+        }
         let ch_idx = r.chapter_idx.min(r.book.chapters.len().saturating_sub(1));
         let key = (
             ch_idx,
@@ -1422,6 +1559,19 @@ impl BookwormMobileApp {
         );
 
         let rebuilt = r.needs_page_recompute || r.pages_cache_key != Some(key);
+        let prev_anchor = if rebuilt
+            && r.pages_cache_key.is_some_and(|k| k.0 == ch_idx)
+            && r.pending_scroll_block.is_none()
+            && r.pending_scroll_fraction.is_none()
+            && !r.pending_last_page
+        {
+            r.chapter_pages
+                .get(r.current_page)
+                .and_then(|p| p.slices.first())
+                .map(|s| (s.block_idx, s.byte_range.start))
+        } else {
+            None
+        };
         if rebuilt {
             let pages = if let Some(ch) = r.book.chapters.get(ch_idx) {
                 paginate_chapter_blocks_for_view(
@@ -1461,6 +1611,8 @@ impl BookwormMobileApp {
         } else if let Some(frac) = r.pending_scroll_fraction.take() {
             let target = (frac.clamp(0.0, 1.0) * (count.saturating_sub(1) as f32)).round() as usize;
             r.current_page = align_page(target);
+        } else if let Some((blk, byte_off)) = prev_anchor {
+            r.current_page = align_page(page_index_for_block(&r.chapter_pages, blk, byte_off));
         } else {
             r.current_page = align_page(r.current_page);
         }
@@ -1984,6 +2136,8 @@ impl BookwormMobileApp {
             notes_color_filter: None,
             notes_only_filter: false,
             draft: None,
+            draft_sheet_bounds: Rc::new(RefCell::new(None)),
+            settings_strip_bounds: Rc::new(RefCell::new(None)),
             viewport_bounds: Rc::new(Cell::new(Bounds::default())),
             chapter_pages: vec![ChapterPage {
                 slices: Vec::new(),
@@ -2003,6 +2157,7 @@ impl BookwormMobileApp {
             page_touch_mode: None,
             page_touch_gen: 0,
             page_touch_start_x: 0.0,
+            page_touch_cur_pos: Point::default(),
             page_touch_last_x: 0.0,
             page_touch_last_at: None,
             page_touch_vel_x: 0.0,
@@ -2537,6 +2692,9 @@ impl Render for BookwormMobileApp {
                                     .bg(crate::theme::hex_color(crate::theme::kd::BG_DEEP)),
                             )
                         })
+                    })
+                    .when(self.book_context_menu.is_some(), |frame| {
+                        frame.child(library_view::render_book_context_menu(self, cx))
                     })
                     .when(self.folder_picker.is_some(), |frame| {
                         frame.child(settings_view::render_folder_picker_modal(

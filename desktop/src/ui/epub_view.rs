@@ -587,6 +587,9 @@ impl EpubView {
         if self.prefs.pagination != ReaderPaginationPref::Page || vp_w < 160.0 || vp_h < 220.0 {
             return;
         }
+        if self.pages_cache_key.is_some() && self.is_dragging_selection {
+            return;
+        }
         let two_col = self.prefs.width == ReaderWidthPref::TwoColumn;
         let ch_idx = self
             .chapter_idx
@@ -602,6 +605,19 @@ impl EpubView {
         );
 
         let rebuilt = self.needs_page_recompute || self.pages_cache_key != Some(key);
+        let prev_anchor = if rebuilt
+            && self.pages_cache_key.is_some_and(|k| k.0 == ch_idx)
+            && self.pending_scroll_block.is_none()
+            && self.pending_scroll_fraction.is_none()
+            && !self.pending_last_page
+        {
+            self.chapter_pages
+                .get(self.current_page)
+                .and_then(|p| p.slices.first())
+                .map(|s| (s.block_idx, s.byte_range.start))
+        } else {
+            None
+        };
         if rebuilt {
             let outer_inner_w = (vp_w - 48.0).max(200.0);
             let card_w = self
@@ -738,6 +754,8 @@ impl EpubView {
         } else if let Some(frac) = self.pending_scroll_fraction.take() {
             let tgt = (frac.clamp(0.0, 1.0) * (count.saturating_sub(1) as f32)).round() as usize;
             self.current_page = align(tgt);
+        } else if let Some((blk, byte_off)) = prev_anchor {
+            self.current_page = align(page_index_for_block(&self.chapter_pages, blk, byte_off));
         } else {
             self.current_page = align(self.current_page);
         }
